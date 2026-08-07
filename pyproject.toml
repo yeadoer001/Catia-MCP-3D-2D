@@ -1,0 +1,12 @@
+[project]
+name = "catia-v5-mcp-server"
+version = "0.1.0"
+description = "CATIA V5 MCP server through Windows COM automation"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp",
+    "pywin32"
+]
+
+[tool.setuptools.packages.find]
+include = ["catia_mcp*"]
