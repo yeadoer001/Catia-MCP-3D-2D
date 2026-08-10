@@ -1,0 +1,2815 @@
+"""
+drawing_template_tools.py
+Version: drawing-template-tools-fixed-2026-08-03-v6
+
+Verified CATIA V5 title-block, projection-standard and drawing-frame tools.
+
+v6 adds paste-first replacement, complete paste-delta verification, transactional
+title-field updates, and safe template-document cleanup.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def _success(data: Any, warnings: Optional[List[str]] = None) -> Dict[str, Any]:
+    warning_list = list(warnings or [])
+    return {
+        "implementation_version": IMPLEMENTATION_VERSION,
+        "ok": True,
+        "status": "success_with_warnings" if warning_list else "success",
+        "data": data,
+        "warnings": warning_list,
+    }
+
+
+def _error(
+    message: str,
+    *,
+    data: Any = None,
+    warnings: Optional[List[str]] = None,
+    status: str = "error",
+) -> Dict[str, Any]:
+    result = {
+        "implementation_version": IMPLEMENTATION_VERSION,
+        "ok": False,
+        "status": status,
+        "error": str(message),
+        "warnings": list(warnings or []),
+    }
+    if data is not None:
+        result["data"] = data
+    return result
+
+
+class ToolOperationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        data: Any = None,
+        warnings: Optional[List[str]] = None,
+        status: str = "error",
+    ) -> None:
+        super().__init__(message)
+        self.data = data
+        self.warnings = list(warnings or [])
+        self.status = status
+
+
+def _format_com_error(exc: BaseException) -> str:
+    details = getattr(exc, "excepinfo", None)
+    if details and len(details) >= 3 and details[2]:
+        return str(details[2])
+    return str(exc)
+
+
+def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _safe_count(collection: Any) -> Optional[int]:
+    if collection is None:
+        return None
+    try:
+        return int(collection.Count)
+    except Exception:
+        return None
+
+
+def _finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite.")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite.") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite.")
+    return result
+
+
+def _document_saved(document: Any) -> Optional[bool]:
+    try:
+        return bool(document.Saved)
+    except Exception:
+        return None
+
+
+def _normalised_path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _evaluate(
+    catia_app: Any,
+    script: str,
+    function_name: str,
+    parameters: List[Any],
+) -> Any:
+    try:
+        return catia_app.SystemService.Evaluate(
+            script,
+            _CATVB_SCRIPT_LANGUAGE,
+            function_name,
+            parameters,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"SystemService.Evaluate failed for {function_name}: "
+            f"{_format_com_error(exc)}"
+        ) from exc
+
+# ---------------------------------------------------------------------------
+# Constants & Enums
+# ---------------------------------------------------------------------------
+
+# v6: paste-first, non-destructive replacement with verified rollback paths.
+
+IMPLEMENTATION_VERSION = "drawing-template-tools-fixed-2026-08-03-v6"
+# CATScriptLanguage is zero based: CATVBScriptLanguage=0,
+# CATVBALanguage=1.  Evaluate executes inline VBScript, not a VBA project.
+_CATVB_SCRIPT_LANGUAGE = 0
+
+PROJECTION_FIRST_ANGLE = "first_angle"
+PROJECTION_THIRD_ANGLE = "third_angle"
+PROJECTION_UNKNOWN = "unknown"
+
+PAPER_SIZE_NAMES = {
+    0: "LETTER",
+    1: "LEGAL",
+    2: "A0",
+    3: "A1",
+    4: "A2",
+    5: "A3",
+    6: "A4",
+    13: "USER",
+}
+
+ORIENTATION_NAMES = {
+    0: "portrait",
+    1: "landscape",
+}
+
+STANDARD_PAPER_PORTRAIT_MM = {
+    "A0": (841.0, 1189.0),
+    "A1": (594.0, 841.0),
+    "A2": (420.0, 594.0),
+    "A3": (297.0, 420.0),
+    "A4": (210.0, 297.0),
+    "LETTER": (215.9, 279.4),
+    "LEGAL": (215.9, 355.6),
+}
+
+
+# Standard Title Block property keys
+TITLE_BLOCK_KEYS = ["Material", "Weight", "Drafter", "Date", "Scale",
+                    "PartNumber", "Description", "SheetFormat", "Revision"]
+
+# ---------------------------------------------------------------------------
+# Core Helper Functions
+# ---------------------------------------------------------------------------
+
+def _get_drawing_document(catia_app):
+    """Return the active CATDrawing, including unsaved Drawing documents."""
+    doc = catia_app.ActiveDocument
+    if doc is None:
+        raise RuntimeError(
+            "No active document. Open or create a CATDrawing first."
+        )
+    try:
+        sheets = doc.Sheets
+        _ = sheets.Count
+    except Exception as exc:
+        raise RuntimeError(
+            f"Active document '{_safe_attr(doc, 'Name', '')}' "
+            "is not a CATDrawing."
+        ) from exc
+    return doc
+
+
+def _get_active_sheet(drawing_doc) -> Any:
+    sheets = drawing_doc.Sheets
+    return sheets.ActiveSheet
+
+
+def _get_background_view(sheet) -> Any:
+    """Return CATIA's system Background View by collection position."""
+    views = sheet.Views
+    if int(views.Count) < 2:
+        raise RuntimeError(
+            "Sheet does not contain Main View and Background View."
+        )
+    view = views.Item(2)
+    # DrawingSheet.reorder_Views documents that the first two system views
+    # are Main View and Background View.  When ViewType is exposed, verify
+    # the second item as catViewBackground (the first enum value, code 0).
+    view_type = _safe_attr(view, "ViewType", None)
+    if view_type is not None:
+        try:
+            if int(view_type) != 0:
+                raise RuntimeError(
+                    "DrawingSheet.Views.Item(2) is not the Background View "
+                    f"(ViewType={int(view_type)})."
+                )
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return view
+
+
+
+
+
+
+def _detect_projection_method(
+    catia_app: Any,
+    sheet: Any,
+) -> Dict[str, Any]:
+    """Detect first/third angle using CATIA-side enum constants."""
+    script = (
+        "Public Function MCP_DetectProjection(sheetObject)\n"
+        " If sheetObject.ProjectionMethod = catFirstAngle Then\n"
+        "  MCP_DetectProjection = \"first_angle\"\n"
+        " ElseIf sheetObject.ProjectionMethod = catThirdAngle Then\n"
+        "  MCP_DetectProjection = \"third_angle\"\n"
+        " Else\n"
+        "  MCP_DetectProjection = \"unknown\"\n"
+        " End If\n"
+        "End Function"
+    )
+    actual_code = None
+    try:
+        actual_code = int(sheet.ProjectionMethod)
+    except Exception:
+        pass
+
+    # CatSheetProjectionMethod is zero based in the Automation type library.
+    # Prefer the direct property, and use CATIA-side symbolic constants only
+    # when late binding cannot return a numeric enum value.
+    direct_mapping = {
+        0: PROJECTION_FIRST_ANGLE,
+        1: PROJECTION_THIRD_ANGLE,
+    }
+    method = direct_mapping.get(actual_code, PROJECTION_UNKNOWN)
+    read_method = (
+        "DrawingSheet.ProjectionMethod"
+        if method != PROJECTION_UNKNOWN else None
+    )
+    error = None
+    if method == PROJECTION_UNKNOWN:
+        try:
+            evaluated = str(
+                _evaluate(
+                    catia_app,
+                    script,
+                    "MCP_DetectProjection",
+                    [sheet],
+                )
+            ).strip().lower()
+            if evaluated in {PROJECTION_FIRST_ANGLE, PROJECTION_THIRD_ANGLE}:
+                method = evaluated
+                read_method = "SystemService.Evaluate_CATVBScriptLanguage"
+            else:
+                error = f"CATIA returned unrecognised projection value: {evaluated!r}."
+        except Exception as exc:
+            error = str(exc)
+
+    labels = {
+        PROJECTION_FIRST_ANGLE: "First Angle (ISO)",
+        PROJECTION_THIRD_ANGLE: "Third Angle (ANSI)",
+        PROJECTION_UNKNOWN: "Unknown",
+    }
+    descriptions = {
+        PROJECTION_FIRST_ANGLE: (
+            "Top view below Front; right-side view left of Front."
+        ),
+        PROJECTION_THIRD_ANGLE: (
+            "Top view above Front; right-side view right of Front."
+        ),
+        PROJECTION_UNKNOWN: (
+            "Projection method could not be classified."
+        ),
+    }
+    return {
+        "method": method,
+        "label": labels.get(method, "Unknown"),
+        "description": descriptions.get(
+            method,
+            descriptions[PROJECTION_UNKNOWN],
+        ),
+        "actual_code": actual_code,
+        "read_method": read_method,
+        "is_first_angle": method == PROJECTION_FIRST_ANGLE,
+        "is_third_angle": method == PROJECTION_THIRD_ANGLE,
+        "verified": method in {
+            PROJECTION_FIRST_ANGLE,
+            PROJECTION_THIRD_ANGLE,
+        },
+        "read_error": error,
+    }
+
+
+
+_FIELD_ALIASES = {
+    "material": "Material",
+    "weight": "Weight",
+    "mass": "Weight",
+    "drafter": "Drafter",
+    "drawnby": "Drafter",
+    "designer": "Drafter",
+    "date": "Date",
+    "scale": "Scale",
+    "partnumber": "PartNumber",
+    "partno": "PartNumber",
+    "drawingnumber": "PartNumber",
+    "description": "Description",
+    "title": "Description",
+    "sheetformat": "SheetFormat",
+    "format": "SheetFormat",
+    "papersize": "SheetFormat",
+    "revision": "Revision",
+    "rev": "Revision",
+}
+
+
+def _resolve_sheet(
+    drawing_doc: Any,
+    sheet_index: Optional[int],
+) -> Tuple[Any, Dict[str, Any]]:
+    sheets = drawing_doc.Sheets
+    count = int(sheets.Count)
+    if sheet_index is None:
+        sheet = sheets.ActiveSheet
+        index = None
+        for i in range(1, count + 1):
+            try:
+                if sheets.Item(i).Name == sheet.Name:
+                    index = i
+                    break
+            except Exception:
+                continue
+        method = "DrawingSheets.ActiveSheet"
+    else:
+        if isinstance(sheet_index, bool):
+            raise ValueError("sheet_index must be a positive integer.")
+        index = int(sheet_index)
+        if index < 1 or index > count:
+            raise IndexError(
+                f"sheet_index={index} is outside 1..{count}."
+            )
+        sheet = sheets.Item(index)
+        method = f"DrawingSheets.Item({index})"
+    return sheet, {
+        "selection_method": method,
+        "sheet_index": index,
+        "sheet_name": str(sheet.Name),
+        "sheet_count": count,
+    }
+
+
+def _background_info(view: Any) -> Dict[str, Any]:
+    view_type = _safe_attr(view, "ViewType", None)
+    return {
+        "selection_method": (
+            "DrawingSheet.Views.Item(2)_official_system_order"
+        ),
+        "index": 2,
+        "name": str(_safe_attr(view, "Name", "")),
+        "view_type_code": (
+            int(view_type) if view_type is not None else None
+        ),
+    }
+
+
+def _normalise_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _canonical_field(value: str) -> Optional[str]:
+    if value in TITLE_BLOCK_KEYS:
+        return value
+    return _FIELD_ALIASES.get(_normalise_label(value))
+
+
+def _split_label_value(
+    content: str,
+) -> Tuple[str, str, Optional[str]]:
+    match = re.match(
+        r"^\s*([^:=：]+?)\s*([:=：])\s*(.*?)\s*$",
+        content,
+        flags=re.DOTALL,
+    )
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(3).strip(),
+            match.group(2),
+        )
+    return content.strip(), "", None
+
+
+def _read_text_records(
+    background_view: Any,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    records: List[Dict[str, Any]] = []
+    texts = background_view.Texts
+
+    for index in range(1, int(texts.Count) + 1):
+        try:
+            obj = texts.Item(index)
+            content = str(obj.Text)
+            object_name = str(_safe_attr(obj, "Name", "")).strip()
+            label, value, separator = _split_label_value(content)
+            canonical_from_content = _canonical_field(label)
+            canonical_from_name = _canonical_field(object_name)
+            match_mode = None
+            canonical_field = None
+            if separator is not None and canonical_from_content is not None:
+                canonical_field = canonical_from_content
+                match_mode = "label_value_text"
+            elif canonical_from_name is not None:
+                canonical_field = canonical_from_name
+                match_mode = "drawing_text_name"
+                label = object_name
+                value = content
+            elif canonical_from_content is not None:
+                canonical_field = canonical_from_content
+                match_mode = "label_only_text"
+            x = _safe_attr(obj, "x", None)
+            y = _safe_attr(obj, "y", None)
+            linked_count = _safe_attr(obj, "NbLink", None)
+            records.append({
+                "index": index,
+                "object_name": object_name,
+                "text": content,
+                "label": label,
+                "value": value,
+                "separator": separator,
+                "canonical_field": canonical_field,
+                "match_mode": match_mode,
+                # DrawingText.x/y are metres in the Automation API.
+                "x_mm": float(x) * 1000.0 if x is not None else None,
+                "y_mm": float(y) * 1000.0 if y is not None else None,
+                "linked_parameter_count": (
+                    int(linked_count) if linked_count is not None else None
+                ),
+            })
+        except Exception as exc:
+            warnings.append(
+                f"DrawingText index {index} could not be read: "
+                f"{_format_com_error(exc)}"
+            )
+    return records, warnings
+
+
+def _group_text_records(
+    records: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    grouped = {key: [] for key in TITLE_BLOCK_KEYS}
+    for record in records:
+        field_name = record["canonical_field"]
+        if field_name in grouped:
+            grouped[field_name].append(record)
+    return grouped
+
+
+def _canonicalise_properties(
+    properties: Dict[str, str],
+) -> Dict[str, str]:
+    if not isinstance(properties, dict) or not properties:
+        raise ValueError("properties must be a non-empty object.")
+    result: Dict[str, str] = {}
+    unsupported: List[str] = []
+    for raw_key, raw_value in properties.items():
+        key = str(raw_key).strip()
+        canonical = _canonical_field(key)
+        if canonical is None:
+            unsupported.append(key)
+        else:
+            result[canonical] = str(raw_value)
+    if unsupported:
+        raise ValueError(
+            "Unsupported properties: "
+            + ", ".join(unsupported)
+            + ". Supported: "
+            + ", ".join(TITLE_BLOCK_KEYS)
+        )
+    return result
+
+
+def _update_drawing(
+    drawing_doc: Any,
+    sheet: Any,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    attempts: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for name, action in (
+        ("DrawingSheet.ForceUpdate", lambda: sheet.ForceUpdate()),
+        ("DrawingDocument.Update", lambda: drawing_doc.Update()),
+    ):
+        try:
+            action()
+            attempts.append({
+                "method": name,
+                "succeeded": True,
+                "error": None,
+            })
+        except Exception as exc:
+            message = _format_com_error(exc)
+            attempts.append({
+                "method": name,
+                "succeeded": False,
+                "error": message,
+            })
+            warnings.append(f"{name} failed: {message}")
+    return attempts, warnings
+
+
+def _delete_object(
+    drawing_doc: Any,
+    obj: Any,
+) -> Dict[str, Any]:
+    selection = drawing_doc.Selection
+    try:
+        selection.Clear()
+        selection.Add(obj)
+        selection.Delete()
+        selection.Clear()
+        return {
+            "attempted": True,
+            "succeeded": True,
+            "error": None,
+        }
+    except Exception as exc:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error": _format_com_error(exc),
+        }
+
+
+
+def _read_sheet_property(
+    catia_app: Any,
+    sheet: Any,
+    property_name: str,
+) -> Dict[str, Any]:
+    """Read a DrawingSheet scalar property without leaking COM errors."""
+    supported = {
+        "PaperSize": ("MCP_ReadPaperSize", "CLng(sheetObject.PaperSize)"),
+        "Orientation": ("MCP_ReadOrientation", "CLng(sheetObject.Orientation)"),
+        "ProjectionMethod": (
+            "MCP_ReadProjectionMethod",
+            "CLng(sheetObject.ProjectionMethod)",
+        ),
+    }
+    if property_name not in supported:
+        raise ValueError(
+            f"Unsupported DrawingSheet property: {property_name}."
+        )
+
+    attempts: List[Dict[str, Any]] = []
+    try:
+        value = int(getattr(sheet, property_name))
+        attempts.append({
+            "method": f"DrawingSheet.{property_name}",
+            "succeeded": True,
+            "value": value,
+            "error": None,
+        })
+        return {
+            "value": value,
+            "read_method": attempts[-1]["method"],
+            "attempts": attempts,
+            "verified": True,
+        }
+    except Exception as exc:
+        attempts.append({
+            "method": f"DrawingSheet.{property_name}",
+            "succeeded": False,
+            "value": None,
+            "error": _format_com_error(exc),
+        })
+
+    function_name, expression = supported[property_name]
+    script = (
+        f"Public Function {function_name}(sheetObject)\n"
+        f" {function_name} = {expression}\n"
+        "End Function"
+    )
+    try:
+        value = int(
+            _evaluate(
+                catia_app,
+                script,
+                function_name,
+                [sheet],
+            )
+        )
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                f"DrawingSheet.{property_name}"
+            ),
+            "succeeded": True,
+            "value": value,
+            "error": None,
+        })
+        return {
+            "value": value,
+            "read_method": attempts[-1]["method"],
+            "attempts": attempts,
+            "verified": True,
+        }
+    except Exception as exc:
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                f"DrawingSheet.{property_name}"
+            ),
+            "succeeded": False,
+            "value": None,
+            "error": _format_com_error(exc),
+        })
+
+    return {
+        "value": None,
+        "read_method": None,
+        "attempts": attempts,
+        "verified": False,
+    }
+
+
+def _set_sheet_property(
+    catia_app: Any,
+    sheet: Any,
+    property_name: str,
+    value: int,
+) -> Dict[str, Any]:
+    """Set and verify a DrawingSheet scalar property with CATIA fallback."""
+    supported = {
+        "PaperSize": "MCP_SetPaperSize",
+        "Orientation": "MCP_SetOrientation",
+        "ProjectionMethod": "MCP_SetProjectionMethodCode",
+    }
+    if property_name not in supported:
+        raise ValueError(
+            f"Unsupported DrawingSheet property: {property_name}."
+        )
+
+    requested = int(value)
+    attempts: List[Dict[str, Any]] = []
+
+    try:
+        setattr(sheet, property_name, requested)
+        attempts.append({
+            "method": f"DrawingSheet.{property_name}=value",
+            "succeeded": True,
+            "error": None,
+        })
+    except Exception as exc:
+        attempts.append({
+            "method": f"DrawingSheet.{property_name}=value",
+            "succeeded": False,
+            "error": _format_com_error(exc),
+        })
+
+    readback = _read_sheet_property(
+        catia_app,
+        sheet,
+        property_name,
+    )
+    if readback["verified"] and readback["value"] == requested:
+        return {
+            "property": property_name,
+            "requested": requested,
+            "selected_method": attempts[-1]["method"],
+            "attempts": attempts,
+            "readback": readback,
+            "verified": True,
+        }
+
+    function_name = supported[property_name]
+    script = (
+        f"Public Function {function_name}(sheetObject, propertyValue)\n"
+        f" sheetObject.{property_name} = CLng(propertyValue)\n"
+        f" {function_name} = CLng(sheetObject.{property_name})\n"
+        "End Function"
+    )
+    try:
+        actual = int(
+            _evaluate(
+                catia_app,
+                script,
+                function_name,
+                [sheet, requested],
+            )
+        )
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                f"DrawingSheet.{property_name}=value"
+            ),
+            "succeeded": True,
+            "actual": actual,
+            "error": None,
+        })
+    except Exception as exc:
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                f"DrawingSheet.{property_name}=value"
+            ),
+            "succeeded": False,
+            "actual": None,
+            "error": _format_com_error(exc),
+        })
+
+    readback = _read_sheet_property(
+        catia_app,
+        sheet,
+        property_name,
+    )
+    verified = bool(
+        readback["verified"]
+        and readback["value"] == requested
+    )
+    selected_method = None
+    for attempt in reversed(attempts):
+        if attempt["succeeded"]:
+            selected_method = attempt["method"]
+            break
+
+    return {
+        "property": property_name,
+        "requested": requested,
+        "selected_method": selected_method,
+        "attempts": attempts,
+        "readback": readback,
+        "verified": verified,
+    }
+
+
+def _standard_paper_dimensions(
+    paper_size_code: Optional[int],
+    orientation_code: Optional[int],
+) -> Tuple[Optional[float], Optional[float]]:
+    paper_name = PAPER_SIZE_NAMES.get(paper_size_code)
+    orientation = ORIENTATION_NAMES.get(orientation_code)
+    values = STANDARD_PAPER_PORTRAIT_MM.get(paper_name)
+    if values is None or orientation is None:
+        return None, None
+
+    portrait_width, portrait_height = values
+    if orientation == "landscape":
+        return (
+            max(portrait_width, portrait_height),
+            min(portrait_width, portrait_height),
+        )
+    return (
+        min(portrait_width, portrait_height),
+        max(portrait_width, portrait_height),
+    )
+
+
+def _read_paper_dimensions_from_api(
+    catia_app: Any,
+    sheet: Any,
+) -> Dict[str, Any]:
+    attempts: List[Dict[str, Any]] = []
+
+    try:
+        width = float(sheet.GetPaperWidth())
+        height = float(sheet.GetPaperHeight())
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0.0
+            or height <= 0.0
+        ):
+            raise RuntimeError(
+                f"Invalid paper dimensions: {width} x {height}."
+            )
+        attempts.append({
+            "method": (
+                "DrawingSheet.GetPaperWidth/"
+                "GetPaperHeight"
+            ),
+            "succeeded": True,
+            "width_mm": width,
+            "height_mm": height,
+            "error": None,
+        })
+        return {
+            "width_mm": width,
+            "height_mm": height,
+            "read_method": attempts[-1]["method"],
+            "attempts": attempts,
+            "verified": True,
+        }
+    except Exception as exc:
+        attempts.append({
+            "method": (
+                "DrawingSheet.GetPaperWidth/"
+                "GetPaperHeight"
+            ),
+            "succeeded": False,
+            "width_mm": None,
+            "height_mm": None,
+            "error": _format_com_error(exc),
+        })
+
+    script = (
+        "Public Function MCP_ReadPaperDimensions(sheetObject)\n"
+        " Dim paperWidth\n"
+        " Dim paperHeight\n"
+        " paperWidth = sheetObject.GetPaperWidth()\n"
+        " paperHeight = sheetObject.GetPaperHeight()\n"
+        " MCP_ReadPaperDimensions = Array("
+        "CDbl(paperWidth), CDbl(paperHeight))\n"
+        "End Function"
+    )
+    try:
+        result = list(
+            _evaluate(
+                catia_app,
+                script,
+                "MCP_ReadPaperDimensions",
+                [sheet],
+            )
+        )
+        if len(result) != 2:
+            raise RuntimeError(
+                f"CATIA returned {len(result)} paper values."
+            )
+        width = float(result[0])
+        height = float(result[1])
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0.0
+            or height <= 0.0
+        ):
+            raise RuntimeError(
+                f"Invalid paper dimensions: {width} x {height}."
+            )
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                "GetPaperWidth/GetPaperHeight"
+            ),
+            "succeeded": True,
+            "width_mm": width,
+            "height_mm": height,
+            "error": None,
+        })
+        return {
+            "width_mm": width,
+            "height_mm": height,
+            "read_method": attempts[-1]["method"],
+            "attempts": attempts,
+            "verified": True,
+        }
+    except Exception as exc:
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                "GetPaperWidth/GetPaperHeight"
+            ),
+            "succeeded": False,
+            "width_mm": None,
+            "height_mm": None,
+            "error": _format_com_error(exc),
+        })
+
+    return {
+        "width_mm": None,
+        "height_mm": None,
+        "read_method": None,
+        "attempts": attempts,
+        "verified": False,
+    }
+
+
+def _paper_dimensions(
+    catia_app: Any,
+    sheet: Any,
+) -> Dict[str, Any]:
+    """Return paper metadata without allowing COM property errors to escape."""
+    paper_size = _read_sheet_property(
+        catia_app,
+        sheet,
+        "PaperSize",
+    )
+    orientation = _read_sheet_property(
+        catia_app,
+        sheet,
+        "Orientation",
+    )
+    dimensions = _read_paper_dimensions_from_api(
+        catia_app,
+        sheet,
+    )
+
+    fallback_used = False
+    if not dimensions["verified"]:
+        width, height = _standard_paper_dimensions(
+            paper_size["value"],
+            orientation["value"],
+        )
+        if width is not None and height is not None:
+            dimensions = {
+                **dimensions,
+                "width_mm": width,
+                "height_mm": height,
+                "read_method": (
+                    "standard_dimensions_from_verified_"
+                    "PaperSize_and_Orientation"
+                ),
+                "verified": True,
+            }
+            fallback_used = True
+
+    paper_code = paper_size["value"]
+    orientation_code = orientation["value"]
+    warnings = []
+    if not paper_size["verified"]:
+        warnings.append(
+            "PaperSize could not be read through direct COM or "
+            "CATIA-side Evaluate."
+        )
+    if not orientation["verified"]:
+        warnings.append(
+            "Orientation could not be read through direct COM or "
+            "CATIA-side Evaluate."
+        )
+    if not dimensions["verified"]:
+        warnings.append(
+            "Paper width and height could not be determined."
+        )
+
+    return {
+        "paper_size_code": paper_code,
+        "paper_size": PAPER_SIZE_NAMES.get(
+            paper_code,
+            None,
+        ),
+        "orientation_code": orientation_code,
+        "orientation": ORIENTATION_NAMES.get(
+            orientation_code,
+            None,
+        ),
+        "width_mm": dimensions["width_mm"],
+        "height_mm": dimensions["height_mm"],
+        "paper_size_read": paper_size,
+        "orientation_read": orientation,
+        "dimension_read": dimensions,
+        "fallback_used": fallback_used,
+        "warnings": warnings,
+        "verified": bool(
+            paper_size["verified"]
+            and orientation["verified"]
+            and dimensions["verified"]
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public Tool Functions
+# ---------------------------------------------------------------------------
+
+def get_title_block_properties(
+    catia_app,
+    sheet_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Read verified title-block properties from a selected sheet."""
+    doc = _get_drawing_document(catia_app)
+    sheet, sheet_info = _resolve_sheet(doc, sheet_index)
+    background = _get_background_view(sheet)
+    records, warnings = _read_text_records(background)
+    grouped = _group_text_records(records)
+
+    properties: Dict[str, str] = {}
+    evidence: Dict[str, Any] = {}
+    for field_name in TITLE_BLOCK_KEYS:
+        matches = grouped[field_name]
+        properties[field_name] = (
+            matches[0]["value"] if matches else ""
+        )
+        evidence[field_name] = {
+            "match_count": len(matches),
+            "ambiguous": len(matches) > 1,
+            "matches": matches,
+        }
+        if len(matches) > 1:
+            warnings.append(
+                f"Multiple texts matched '{field_name}'; "
+                "the first value is returned."
+            )
+
+    return _success({
+        "operation": "get_title_block_properties",
+        "properties": properties,
+        "field_evidence": evidence,
+        "all_background_texts": records,
+        "unrecognised_texts": [
+            item for item in records
+            if item["canonical_field"] is None
+        ],
+        "sheet": sheet_info,
+        "background_view": _background_info(background),
+        "projection": _detect_projection_method(
+            catia_app,
+            sheet,
+        ),
+        "paper": _paper_dimensions(catia_app, sheet),
+        "coordinate_unit": "mm",
+        "model_modified": False,
+        "document_save_required": False,
+        "document_saved": _document_saved(doc),
+    }, warnings)
+
+
+
+def set_title_block_properties(
+    catia_app,
+    properties: Dict[str, str],
+    sheet_index: Optional[int] = None,
+    create_if_missing: bool = False,
+    require_unique: bool = True,
+    base_x_mm: Optional[float] = None,
+    base_y_mm: Optional[float] = None,
+    row_spacing_mm: float = 7.0,
+    sheet_margin_mm: float = 5.0,
+) -> Dict[str, Any]:
+    """Update/create title-block fields as one verified transaction.
+
+    Ambiguous fields and out-of-sheet creation coordinates are rejected before
+    any mutation.  If a later COM write fails, all earlier writes/creations from
+    the same call are rolled back in reverse order.
+    """
+    requested = _canonicalise_properties(properties)
+    doc = _get_drawing_document(catia_app)
+    sheet, sheet_info = _resolve_sheet(doc, sheet_index)
+    background = _get_background_view(sheet)
+    texts = background.Texts
+    records, warnings = _read_text_records(background)
+    grouped = _group_text_records(records)
+    saved_before = _document_saved(doc)
+
+    paper = _paper_dimensions(catia_app, sheet)
+    width = float(paper.get("width_mm") or 420.0)
+    height = float(paper.get("height_mm") or 297.0)
+    margin = _finite_float(sheet_margin_mm, "sheet_margin_mm")
+    if margin < 0.0:
+        raise ValueError("sheet_margin_mm must be zero or greater.")
+    if width <= 2.0 * margin or height <= 2.0 * margin:
+        raise ValueError(
+            "sheet_margin_mm leaves no usable title-field placement area."
+        )
+
+    x_default = (
+        width * 0.62
+        if base_x_mm is None
+        else _finite_float(base_x_mm, "base_x_mm")
+    )
+    y_default = (
+        height * 0.10
+        if base_y_mm is None
+        else _finite_float(base_y_mm, "base_y_mm")
+    )
+    spacing = _finite_float(row_spacing_mm, "row_spacing_mm")
+    if spacing <= 0:
+        raise ValueError("row_spacing_mm must be greater than zero.")
+
+    ambiguous = {
+        field: grouped[field]
+        for field in requested
+        if len(grouped[field]) > 1
+    }
+    if require_unique and ambiguous:
+        return _error(
+            "One or more requested title-block fields are ambiguous. "
+            "No properties were modified.",
+            data={
+                "operation": "set_title_block_properties",
+                "requested_properties": requested,
+                "ambiguous_fields": {
+                    field: {
+                        "match_count": len(matches),
+                        "matches": matches,
+                    }
+                    for field, matches in ambiguous.items()
+                },
+                "sheet": sheet_info,
+                "background_view": _background_info(background),
+                "paper": paper,
+                "model_modified": False,
+                "document_save_required": False,
+                "document_saved_before": saved_before,
+                "document_saved_after": _document_saved(doc),
+                "preflight_verified": False,
+            },
+        )
+
+    creation_plan: Dict[str, Dict[str, Any]] = {}
+    creation_index = 0
+    for field in requested:
+        if grouped[field] or not create_if_missing:
+            continue
+        x = float(x_default)
+        y = float(y_default + creation_index * spacing)
+        creation_index += 1
+        within = bool(
+            margin <= x <= width - margin
+            and margin <= y <= height - margin
+        )
+        creation_plan[field] = {
+            "x_mm": x,
+            "y_mm": y,
+            "within_sheet_margin": within,
+            "left_clearance_mm": x,
+            "right_clearance_mm": width - x,
+            "bottom_clearance_mm": y,
+            "top_clearance_mm": height - y,
+        }
+
+    invalid_positions = {
+        field: item
+        for field, item in creation_plan.items()
+        if not item["within_sheet_margin"]
+    }
+    if invalid_positions:
+        return _error(
+            "One or more missing title-block fields would be created outside "
+            "the selected sheet margin. No properties were modified.",
+            data={
+                "operation": "set_title_block_properties",
+                "requested_properties": requested,
+                "creation_plan": creation_plan,
+                "invalid_creation_positions": invalid_positions,
+                "sheet_margin_mm": margin,
+                "sheet": sheet_info,
+                "background_view": _background_info(background),
+                "paper": paper,
+                "model_modified": False,
+                "document_save_required": False,
+                "document_saved_before": saved_before,
+                "document_saved_after": _document_saved(doc),
+                "preflight_verified": False,
+            },
+        )
+
+    results: Dict[str, Any] = {}
+    undo_stack: List[Dict[str, Any]] = []
+    failed = False
+
+    for field_name, value in requested.items():
+        matches = grouped[field_name]
+        if matches:
+            match = matches[0]
+            obj = texts.Item(match["index"])
+            old_text = str(obj.Text)
+            label, _, separator = _split_label_value(old_text)
+            new_text = f"{label}{separator or ':'} {value}"
+            error = None
+            try:
+                obj.Text = new_text
+                actual_text = str(obj.Text)
+                verified = actual_text == new_text
+            except Exception as exc:
+                actual_text = old_text
+                verified = False
+                error = _format_com_error(exc)
+
+            if verified:
+                undo_stack.append({
+                    "kind": "updated_text",
+                    "field": field_name,
+                    "object": obj,
+                    "old_text": old_text,
+                })
+            else:
+                failed = True
+            results[field_name] = {
+                "action": "updated",
+                "ok": verified,
+                "target_index": match["index"],
+                "match_count": len(matches),
+                "old_text": old_text,
+                "requested_text": new_text,
+                "actual_text": actual_text,
+                "readback_verified": verified,
+                "error": error,
+                "model_modified": verified,
+            }
+            if failed:
+                break
+            continue
+
+        if not create_if_missing:
+            results[field_name] = {
+                "action": "skipped_not_found",
+                "ok": True,
+                "match_count": 0,
+                "model_modified": False,
+            }
+            warnings.append(
+                f"'{field_name}' was not found and create_if_missing=false."
+            )
+            continue
+
+        placement = creation_plan[field_name]
+        x = placement["x_mm"]
+        y = placement["y_mm"]
+        before_count = int(texts.Count)
+        requested_text = f"{field_name}: {value}"
+        obj = None
+        error = None
+        try:
+            obj = texts.Add(requested_text, x, y)
+            after_count = int(texts.Count)
+            actual_text = str(obj.Text)
+            verified = bool(
+                after_count == before_count + 1
+                and actual_text == requested_text
+            )
+        except Exception as exc:
+            after_count = int(texts.Count)
+            actual_text = ""
+            verified = False
+            error = _format_com_error(exc)
+
+        if verified and obj is not None:
+            undo_stack.append({
+                "kind": "created_text",
+                "field": field_name,
+                "object": obj,
+            })
+        else:
+            failed = True
+        results[field_name] = {
+            "action": "created",
+            "ok": verified,
+            "requested_text": requested_text,
+            "actual_text": actual_text,
+            "x_mm": x,
+            "y_mm": y,
+            "placement": placement,
+            "texts_count_before": before_count,
+            "texts_count_after": after_count,
+            "readback_verified": verified,
+            "error": error,
+            "model_modified": verified,
+        }
+        if failed:
+            break
+
+    rollback_results: List[Dict[str, Any]] = []
+    if failed:
+        for item in reversed(undo_stack):
+            if item["kind"] == "updated_text":
+                try:
+                    item["object"].Text = item["old_text"]
+                    verified = str(item["object"].Text) == item["old_text"]
+                    error = None
+                except Exception as exc:
+                    verified = False
+                    error = _format_com_error(exc)
+                rollback_results.append({
+                    "field": item["field"],
+                    "kind": item["kind"],
+                    "succeeded": verified,
+                    "error": error,
+                })
+            else:
+                deletion = _delete_object(doc, item["object"])
+                rollback_results.append({
+                    "field": item["field"],
+                    "kind": item["kind"],
+                    "succeeded": bool(deletion["succeeded"]),
+                    "error": deletion.get("error"),
+                    "deletion": deletion,
+                })
+
+    update_attempts, update_warnings = _update_drawing(doc, sheet)
+    warnings.extend(update_warnings)
+    final_records, final_warnings = _read_text_records(background)
+    warnings.extend(final_warnings)
+    final_grouped = _group_text_records(final_records)
+    final_values = {
+        name: final_grouped[name][0]["value"] if final_grouped[name] else ""
+        for name in TITLE_BLOCK_KEYS
+    }
+
+    rollback_verified = bool(
+        failed
+        and all(item["succeeded"] for item in rollback_results)
+    ) if rollback_results else bool(failed and not undo_stack)
+    modified = bool(undo_stack) and not rollback_verified
+    data = {
+        "operation": "set_title_block_properties",
+        "requested_properties": requested,
+        "results": results,
+        "final_values": final_values,
+        "creation_plan": creation_plan,
+        "sheet_margin_mm": margin,
+        "sheet": sheet_info,
+        "background_view": _background_info(background),
+        "paper": paper,
+        "update_attempts": update_attempts,
+        "transaction": {
+            "atomic": True,
+            "failed": failed,
+            "undo_item_count": len(undo_stack),
+            "rollback_attempted": bool(failed and undo_stack),
+            "rollback_results": rollback_results,
+            "rollback_verified": rollback_verified,
+        },
+        "model_modified": modified if failed else bool(undo_stack),
+        "document_save_required": modified if failed else bool(undo_stack),
+        "document_saved_before": saved_before,
+        "document_saved_after": _document_saved(doc),
+        "preflight_verified": True,
+    }
+
+    if failed:
+        return _error(
+            "One or more title-block properties failed verified update or "
+            "creation. Earlier changes were rolled back where possible.",
+            data=data,
+            warnings=warnings,
+            status="partial_success" if modified else "error",
+        )
+    return _success(data, warnings)
+
+
+
+
+_BACKGROUND_COLLECTIONS = (
+    "GeometricElements",
+    "Components",
+    "Texts",
+    "Tables",
+    "Pictures",
+    "Dimensions",
+    "Leaders",
+    "Arrows",
+    "GDTs",
+    "Weldings",
+    "Threads",
+)
+
+_STRUCTURAL_GEOMETRY_NAMES = {
+    "absoluteaxis",
+    "axis2d",
+    "absolute axis",
+    "绝对轴",
+}
+
+
+def _object_descriptor(
+    collection_name: str,
+    index: int,
+    obj: Any,
+) -> Dict[str, Any]:
+    name = str(_safe_attr(obj, "Name", "")).strip()
+    python_type = type(obj).__name__
+    normalised_name = re.sub(r"\s+", " ", name.lower())
+    normalised_type = python_type.lower()
+    structural_reason = None
+
+    if collection_name == "GeometricElements":
+        if normalised_name in _STRUCTURAL_GEOMETRY_NAMES:
+            structural_reason = "CATIA sketch AbsoluteAxis"
+        elif "axis2d" in normalised_type:
+            structural_reason = "CATIA Axis2D automation object"
+
+    return {
+        "collection": collection_name,
+        "index": index,
+        "name": name,
+        "python_type": python_type,
+        "is_structural": structural_reason is not None,
+        "structural_reason": structural_reason,
+    }
+
+
+def _collection_items_with_descriptors(
+    collection_name: str,
+    collection: Any,
+) -> List[Dict[str, Any]]:
+    count = _safe_count(collection)
+    if count is None:
+        return []
+    result: List[Dict[str, Any]] = []
+    for index in range(1, count + 1):
+        try:
+            obj = collection.Item(index)
+            result.append({
+                "object": obj,
+                "descriptor": _object_descriptor(
+                    collection_name,
+                    index,
+                    obj,
+                ),
+            })
+        except Exception:
+            continue
+    return result
+
+
+def _content_inventory(
+    background_view: Any,
+) -> Dict[str, Any]:
+    raw_counts: Dict[str, Optional[int]] = {}
+    meaningful_counts: Dict[str, int] = {}
+    structural_counts: Dict[str, int] = {}
+    items: Dict[str, List[Dict[str, Any]]] = {}
+    raw_total = 0
+    meaningful_total = 0
+    structural_total = 0
+
+    for name in _BACKGROUND_COLLECTIONS:
+        collection = _safe_attr(background_view, name, None)
+        raw_count = _safe_count(collection)
+        raw_counts[name] = raw_count
+        if raw_count is not None:
+            raw_total += raw_count
+
+        entries = _collection_items_with_descriptors(
+            name,
+            collection,
+        )
+        descriptors = [
+            entry["descriptor"] for entry in entries
+        ]
+        items[name] = descriptors
+        structural_count = sum(
+            1 for item in descriptors
+            if item["is_structural"]
+        )
+        meaningful_count = sum(
+            1 for item in descriptors
+            if not item["is_structural"]
+        )
+        structural_counts[name] = structural_count
+        meaningful_counts[name] = meaningful_count
+        structural_total += structural_count
+        meaningful_total += meaningful_count
+
+    return {
+        **raw_counts,
+        "raw_counts": raw_counts,
+        "meaningful_counts": meaningful_counts,
+        "structural_counts": structural_counts,
+        "raw_total_objects": raw_total,
+        "structural_total_objects": structural_total,
+        # Keep the legacy field name, but define it as user/template content.
+        "total_known_objects": meaningful_total,
+        "meaningful_total_objects": meaningful_total,
+        "has_meaningful_content": meaningful_total > 0,
+        "items": items,
+        "structural_policy": (
+            "exclude AbsoluteAxis/Axis2D from template content"
+        ),
+    }
+
+
+def _content_counts(
+    background_view: Any,
+) -> Dict[str, Any]:
+    return _content_inventory(background_view)
+
+
+def _select_background_contents(
+    drawing_doc: Any,
+    background_view: Any,
+) -> Dict[str, Any]:
+    selection = drawing_doc.Selection
+    selection.Clear()
+    selected_total = 0
+    selected_by_collection: Dict[str, int] = {}
+    skipped_structural: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for name in _BACKGROUND_COLLECTIONS:
+        selected = 0
+        collection = _safe_attr(
+            background_view,
+            name,
+            None,
+        )
+        for entry in _collection_items_with_descriptors(
+            name,
+            collection,
+        ):
+            descriptor = entry["descriptor"]
+            if descriptor["is_structural"]:
+                skipped_structural.append(descriptor)
+                continue
+            try:
+                selection.Add(entry["object"])
+                selected += 1
+                selected_total += 1
+            except Exception as exc:
+                errors.append(
+                    f"{name}[{descriptor['index']}]: "
+                    f"{_format_com_error(exc)}"
+                )
+        selected_by_collection[name] = selected
+
+    return {
+        "selected_total": selected_total,
+        "selected_by_collection": selected_by_collection,
+        "skipped_structural": skipped_structural,
+        "selection_errors": errors,
+        "selection_count_readback": _safe_count(selection),
+    }
+
+
+def _delete_single_background_object(
+    drawing_doc: Any,
+    collection: Any,
+    obj: Any,
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    selection = drawing_doc.Selection
+    attempts: List[Dict[str, Any]] = []
+    before_count = _safe_count(collection)
+
+    try:
+        selection.Clear()
+        selection.Add(obj)
+        selection.Delete()
+        selection.Clear()
+        after_selection_count = _safe_count(collection)
+        selection_verified = bool(
+            before_count is not None
+            and after_selection_count is not None
+            and after_selection_count < before_count
+        )
+        attempts.append({
+            "method": "document.Selection.Delete_single",
+            "succeeded": True,
+            "count_before": before_count,
+            "count_after": after_selection_count,
+            "verified_removed": selection_verified,
+            "error": None,
+        })
+        if selection_verified:
+            return {
+                "descriptor": descriptor,
+                "succeeded": True,
+                "selected_strategy": (
+                    "document.Selection.Delete_single"
+                ),
+                "attempts": attempts,
+            }
+    except Exception as exc:
+        attempts.append({
+            "method": "document.Selection.Delete_single",
+            "succeeded": False,
+            "verified_removed": False,
+            "error": _format_com_error(exc),
+        })
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+
+    # Many Drafting collections expose Remove(index/name). This is
+    # especially important for DrawingComponents and Pictures.
+    for remove_key in (
+        descriptor.get("index"),
+        descriptor.get("name") or None,
+    ):
+        if remove_key is None:
+            continue
+        try:
+            current_before = _safe_count(collection)
+            collection.Remove(remove_key)
+            current_after = _safe_count(collection)
+            verified = bool(
+                current_before is not None
+                and current_after is not None
+                and current_after < current_before
+            )
+            attempts.append({
+                "method": f"collection.Remove({remove_key!r})",
+                "succeeded": True,
+                "count_before": current_before,
+                "count_after": current_after,
+                "verified_removed": verified,
+                "error": None,
+            })
+            if verified:
+                return {
+                    "descriptor": descriptor,
+                    "succeeded": True,
+                    "selected_strategy": (
+                        f"collection.Remove({remove_key!r})"
+                    ),
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({
+                "method": f"collection.Remove({remove_key!r})",
+                "succeeded": False,
+                "verified_removed": False,
+                "error": _format_com_error(exc),
+            })
+
+    return {
+        "descriptor": descriptor,
+        "succeeded": False,
+        "selected_strategy": None,
+        "attempts": attempts,
+    }
+
+
+def _delete_remaining_background_contents(
+    drawing_doc: Any,
+    background_view: Any,
+) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    # Reverse iteration protects collection indices as objects disappear.
+    for name in _BACKGROUND_COLLECTIONS:
+        collection = _safe_attr(background_view, name, None)
+        entries = _collection_items_with_descriptors(
+            name,
+            collection,
+        )
+        for entry in reversed(entries):
+            descriptor = entry["descriptor"]
+            if descriptor["is_structural"]:
+                continue
+            results.append(
+                _delete_single_background_object(
+                    drawing_doc,
+                    collection,
+                    entry["object"],
+                    descriptor,
+                )
+            )
+    return {
+        "attempted": bool(results),
+        "results": results,
+        "all_calls_succeeded": all(
+            result["succeeded"] for result in results
+        ) if results else True,
+    }
+
+
+def _clear_background_contents(
+    drawing_doc: Any,
+    background_view: Any,
+) -> Dict[str, Any]:
+    before = _content_inventory(background_view)
+    selection_result = _select_background_contents(
+        drawing_doc,
+        background_view,
+    )
+    if selection_result["selected_total"] == 0:
+        verified = not before["has_meaningful_content"]
+        return {
+            "attempted": False,
+            "succeeded": verified,
+            "reason": (
+                "No meaningful user/template content. "
+                "CATIA structural axis is intentionally preserved."
+                if verified else
+                "Meaningful content exists but could not be selected."
+            ),
+            "before": before,
+            "after": before,
+            "selection": selection_result,
+            "individual_fallback": {
+                "attempted": False,
+                "results": [],
+            },
+        }
+
+    selection = drawing_doc.Selection
+    error = None
+    try:
+        selection.Delete()
+        selection.Clear()
+        call_succeeded = True
+    except Exception as exc:
+        call_succeeded = False
+        error = _format_com_error(exc)
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+
+    after_batch = _content_inventory(background_view)
+    individual_fallback = {
+        "attempted": False,
+        "results": [],
+        "all_calls_succeeded": True,
+    }
+    if after_batch["has_meaningful_content"]:
+        individual_fallback = _delete_remaining_background_contents(
+            drawing_doc,
+            background_view,
+        )
+
+    after = _content_inventory(background_view)
+    verified = not after["has_meaningful_content"]
+    return {
+        "attempted": True,
+        "succeeded": verified,
+        "delete_call_succeeded": call_succeeded,
+        "error": error,
+        "before": before,
+        "after_batch_delete": after_batch,
+        "after": after,
+        "selection": selection_result,
+        "individual_fallback": individual_fallback,
+        "verification_basis": (
+            "meaningful user/template objects removed; "
+            "AbsoluteAxis/Axis2D preserved"
+        ),
+    }
+
+
+def _copy_background_contents(
+    template_doc: Any,
+    template_background: Any,
+) -> Dict[str, Any]:
+    inventory = _content_inventory(template_background)
+    if not inventory["has_meaningful_content"]:
+        raise ToolOperationError(
+            "Template Background View contains no meaningful "
+            "user/template content. CATIA's structural AbsoluteAxis "
+            "does not count as a drawing frame.",
+            data={
+                "template_preflight": {
+                    "verified_nonempty": False,
+                    "inventory": inventory,
+                },
+                "model_modified": False,
+                "document_save_required": False,
+            },
+        )
+
+    selection_result = _select_background_contents(
+        template_doc,
+        template_background,
+    )
+    if selection_result["selected_total"] == 0:
+        raise ToolOperationError(
+            "Template contains meaningful content, but no template "
+            "objects could be selected for Copy.",
+            data={
+                "template_preflight": {
+                    "verified_nonempty": True,
+                    "inventory": inventory,
+                    "selection": selection_result,
+                },
+                "model_modified": False,
+                "document_save_required": False,
+            },
+        )
+
+    selection = template_doc.Selection
+    try:
+        selection.Copy()
+        succeeded = True
+        error = None
+    except Exception as exc:
+        succeeded = False
+        error = _format_com_error(exc)
+    finally:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+
+    if not succeeded:
+        raise ToolOperationError(
+            f"Template Copy failed: {error}",
+            data={
+                "template_preflight": {
+                    "verified_nonempty": True,
+                    "inventory": inventory,
+                    "selection": selection_result,
+                },
+                "model_modified": False,
+                "document_save_required": False,
+            },
+        )
+    return {
+        "succeeded": True,
+        "template_preflight": {
+            "verified_nonempty": True,
+            "inventory": inventory,
+        },
+        "selection": selection_result,
+    }
+
+
+def _paste_background_contents(
+    target_doc: Any,
+    target_background: Any,
+) -> Dict[str, Any]:
+    selection = target_doc.Selection
+    selection.Clear()
+    selection.Add(target_background)
+    try:
+        selection.Paste()
+        succeeded = True
+        error = None
+    except Exception as exc:
+        succeeded = False
+        error = _format_com_error(exc)
+    finally:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+    return {
+        "succeeded": succeeded,
+        "attempts": [{
+            "method": "target_document.Selection.Paste",
+            "succeeded": succeeded,
+            "error": error,
+        }],
+    }
+
+
+def _activate_document(document: Any) -> Dict[str, Any]:
+    try:
+        document.Activate()
+        return {
+            "attempted": True,
+            "succeeded": True,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error": _format_com_error(exc),
+        }
+
+
+def _activate_view(view: Any) -> Dict[str, Any]:
+    try:
+        view.Activate()
+        return {
+            "attempted": True,
+            "succeeded": True,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error": _format_com_error(exc),
+        }
+
+
+
+def _close_document(
+    document: Any,
+    *,
+    discard_unsaved_changes: bool = False,
+) -> Dict[str, Any]:
+    """Close a document without allowing a modal save prompt to block MCP.
+
+    Template documents opened by this tool are expected to remain unchanged, so
+    normal cleanup uses ``discard_unsaved_changes=False``.  The optional alert
+    suppression is available for rollback/temporary documents and always
+    restores the caller's previous CATIA setting.
+    """
+    details: Dict[str, Any] = {
+        "attempted": document is not None,
+        "succeeded": None,
+        "error": None,
+        "discard_unsaved_changes": bool(discard_unsaved_changes),
+        "file_alerts_temporarily_disabled": False,
+        "file_alerts_disable_error": None,
+        "file_alerts_restore_error": None,
+    }
+    if document is None:
+        return details
+
+    application = _safe_attr(document, "Application", None)
+    previous_alerts: Optional[bool] = None
+    try:
+        if discard_unsaved_changes and application is not None:
+            try:
+                previous_alerts = bool(application.DisplayFileAlerts)
+                application.DisplayFileAlerts = False
+                details["file_alerts_temporarily_disabled"] = True
+            except Exception as exc:
+                details["file_alerts_disable_error"] = _format_com_error(exc)
+        document.Close()
+        details["succeeded"] = True
+    except Exception as exc:
+        details["succeeded"] = False
+        details["error"] = _format_com_error(exc)
+    finally:
+        if previous_alerts is not None:
+            try:
+                application.DisplayFileAlerts = previous_alerts
+            except Exception as exc:
+                details["file_alerts_restore_error"] = _format_com_error(exc)
+    return details
+
+
+
+def _find_open_document(
+    catia_app: Any,
+    path: str,
+) -> Any:
+    target = _normalised_path_key(path)
+    documents = catia_app.Documents
+    for index in range(1, int(documents.Count) + 1):
+        document = documents.Item(index)
+        full_name = str(
+            _safe_attr(document, "FullName", "")
+        )
+        if (
+            full_name
+            and _normalised_path_key(full_name) == target
+        ):
+            return document
+    return None
+
+
+def _sheet_scale(sheet: Any) -> Optional[float]:
+    for name in ("Scale", "Scale2"):
+        try:
+            return float(getattr(sheet, name))
+        except Exception:
+            continue
+    return None
+
+
+def _apply_template_settings(
+    catia_app: Any,
+    target_sheet: Any,
+    template_sheet: Any,
+) -> Dict[str, Any]:
+    requested_reads = {
+        name: _read_sheet_property(
+            catia_app,
+            template_sheet,
+            name,
+        )
+        for name in (
+            "PaperSize",
+            "Orientation",
+            "ProjectionMethod",
+        )
+    }
+    before_reads = {
+        name: _read_sheet_property(
+            catia_app,
+            target_sheet,
+            name,
+        )
+        for name in (
+            "PaperSize",
+            "Orientation",
+            "ProjectionMethod",
+        )
+    }
+    requested_scale = _sheet_scale(template_sheet)
+    before_scale = _sheet_scale(target_sheet)
+
+    missing_requested = [
+        name
+        for name, result in requested_reads.items()
+        if not result["verified"]
+    ]
+    if missing_requested:
+        return {
+            "requested": {
+                **{
+                    name: result["value"]
+                    for name, result in requested_reads.items()
+                },
+                "Scale": requested_scale,
+            },
+            "before": {
+                **{
+                    name: result["value"]
+                    for name, result in before_reads.items()
+                },
+                "Scale": before_scale,
+            },
+            "requested_reads": requested_reads,
+            "before_reads": before_reads,
+            "after_reads": {},
+            "attempts": [],
+            "scale_set_method": None,
+            "verified": False,
+            "model_modified": False,
+            "error": (
+                "Template sheet settings could not be read: "
+                + ", ".join(missing_requested)
+            ),
+        }
+
+    attempts: List[Dict[str, Any]] = []
+    property_results: Dict[str, Any] = {}
+    for name in (
+        "PaperSize",
+        "Orientation",
+        "ProjectionMethod",
+    ):
+        result = _set_sheet_property(
+            catia_app,
+            target_sheet,
+            name,
+            requested_reads[name]["value"],
+        )
+        property_results[name] = result
+        attempts.extend(result["attempts"])
+
+    scale_method = None
+    scale_verified = requested_scale is None
+    scale_attempts: List[Dict[str, Any]] = []
+    if requested_scale is not None:
+        for name in ("Scale", "Scale2"):
+            try:
+                setattr(
+                    target_sheet,
+                    name,
+                    requested_scale,
+                )
+                actual_scale = _sheet_scale(target_sheet)
+                verified = bool(
+                    actual_scale is not None
+                    and abs(actual_scale - requested_scale)
+                    <= 1e-9
+                )
+                scale_attempts.append({
+                    "property": name,
+                    "succeeded": True,
+                    "actual": actual_scale,
+                    "verified": verified,
+                    "error": None,
+                })
+                if verified:
+                    scale_method = name
+                    scale_verified = True
+                    break
+            except Exception as exc:
+                scale_attempts.append({
+                    "property": name,
+                    "succeeded": False,
+                    "actual": None,
+                    "verified": False,
+                    "error": _format_com_error(exc),
+                })
+    attempts.extend(scale_attempts)
+
+    after_reads = {
+        name: _read_sheet_property(
+            catia_app,
+            target_sheet,
+            name,
+        )
+        for name in (
+            "PaperSize",
+            "Orientation",
+            "ProjectionMethod",
+        )
+    }
+    after_scale = _sheet_scale(target_sheet)
+
+    property_verified = all(
+        property_results[name]["verified"]
+        and after_reads[name]["verified"]
+        and after_reads[name]["value"]
+        == requested_reads[name]["value"]
+        for name in property_results
+    )
+    verified = bool(property_verified and scale_verified)
+
+    changed = any(
+        before_reads[name]["verified"]
+        and after_reads[name]["verified"]
+        and before_reads[name]["value"]
+        != after_reads[name]["value"]
+        for name in property_results
+    )
+    if (
+        before_scale is not None
+        and after_scale is not None
+        and abs(after_scale - before_scale) > 1e-9
+    ):
+        changed = True
+
+    return {
+        "requested": {
+            **{
+                name: result["value"]
+                for name, result in requested_reads.items()
+            },
+            "Scale": requested_scale,
+        },
+        "before": {
+            **{
+                name: result["value"]
+                for name, result in before_reads.items()
+            },
+            "Scale": before_scale,
+        },
+        "after": {
+            **{
+                name: result["value"]
+                for name, result in after_reads.items()
+            },
+            "Scale": after_scale,
+        },
+        "requested_reads": requested_reads,
+        "before_reads": before_reads,
+        "after_reads": after_reads,
+        "property_results": property_results,
+        "attempts": attempts,
+        "scale_set_method": scale_method,
+        "scale_verified": scale_verified,
+        "verified": verified,
+        "model_modified": changed,
+        "error": None if verified else (
+            "One or more sheet settings failed verified readback."
+        ),
+    }
+
+
+
+def _capture_meaningful_background_objects(
+    background_view: Any,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    captured: Dict[str, List[Dict[str, Any]]] = {}
+    descriptors: Dict[str, List[Dict[str, Any]]] = {}
+    total = 0
+    for name in _BACKGROUND_COLLECTIONS:
+        collection = _safe_attr(background_view, name, None)
+        entries = [
+            entry
+            for entry in _collection_items_with_descriptors(name, collection)
+            if not entry["descriptor"]["is_structural"]
+        ]
+        captured[name] = entries
+        descriptors[name] = [entry["descriptor"] for entry in entries]
+        total += len(entries)
+    return captured, {
+        "captured_total": total,
+        "captured_by_collection": {
+            name: len(entries) for name, entries in captured.items()
+        },
+        "descriptors": descriptors,
+    }
+
+
+def _delete_captured_background_objects(
+    drawing_doc: Any,
+    background_view: Any,
+    captured: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    before = _content_inventory(background_view)
+    results: List[Dict[str, Any]] = []
+    for name in _BACKGROUND_COLLECTIONS:
+        collection = _safe_attr(background_view, name, None)
+        for entry in reversed(captured.get(name, [])):
+            results.append(
+                _delete_single_background_object(
+                    drawing_doc,
+                    collection,
+                    entry["object"],
+                    entry["descriptor"],
+                )
+            )
+    after = _content_inventory(background_view)
+    failed = [item for item in results if not item["succeeded"]]
+    return {
+        "attempted": bool(results),
+        "succeeded": not failed,
+        "strategy": "delete_preexisting_objects_after_verified_paste",
+        "results": results,
+        "failed_count": len(failed),
+        "before": before,
+        "after": after,
+        "data_loss_policy": (
+            "template is pasted and verified before any preexisting target "
+            "object is deleted"
+        ),
+    }
+
+
+def _paste_delta_verification(
+    copy_result: Dict[str, Any],
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> Dict[str, Any]:
+    expected_by = dict(
+        copy_result.get("selection", {}).get("selected_by_collection", {})
+    )
+    expected_total = int(
+        copy_result.get("selection", {}).get("selected_total", 0) or 0
+    )
+    before_by = before.get("meaningful_counts", {})
+    after_by = after.get("meaningful_counts", {})
+    delta_by = {
+        name: int(after_by.get(name, 0)) - int(before_by.get(name, 0))
+        for name in _BACKGROUND_COLLECTIONS
+    }
+    total_delta = int(after.get("meaningful_total_objects", 0)) - int(
+        before.get("meaningful_total_objects", 0)
+    )
+    collection_results = {
+        name: {
+            "expected_minimum": int(expected_by.get(name, 0) or 0),
+            "actual_delta": int(delta_by.get(name, 0)),
+            "verified": int(delta_by.get(name, 0)) >= int(expected_by.get(name, 0) or 0),
+        }
+        for name in _BACKGROUND_COLLECTIONS
+        if int(expected_by.get(name, 0) or 0) > 0
+    }
+    verified = bool(
+        expected_total > 0
+        and total_delta >= expected_total
+        and all(item["verified"] for item in collection_results.values())
+    )
+    return {
+        "verified": verified,
+        "expected_total": expected_total,
+        "actual_total_delta": total_delta,
+        "expected_by_collection": expected_by,
+        "actual_delta_by_collection": delta_by,
+        "collection_results": collection_results,
+        "verification_policy": (
+            "every copied collection must gain at least its selected object "
+            "count; total delta must cover all copied objects"
+        ),
+    }
+
+
+def _rollback_added_background_objects(
+    drawing_doc: Any,
+    background_view: Any,
+    baseline: Dict[str, Any],
+) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    baseline_raw = baseline.get("raw_counts", {})
+    for name in _BACKGROUND_COLLECTIONS:
+        collection = _safe_attr(background_view, name, None)
+        current_count = _safe_count(collection)
+        keep_count = int(baseline_raw.get(name) or 0)
+        if current_count is None:
+            continue
+        for index in range(current_count, keep_count, -1):
+            try:
+                obj = collection.Item(index)
+                descriptor = _object_descriptor(name, index, obj)
+                if descriptor["is_structural"]:
+                    continue
+                results.append(
+                    _delete_single_background_object(
+                        drawing_doc,
+                        collection,
+                        obj,
+                        descriptor,
+                    )
+                )
+            except Exception as exc:
+                results.append({
+                    "descriptor": {"collection": name, "index": index},
+                    "succeeded": False,
+                    "selected_strategy": None,
+                    "attempts": [],
+                    "error": _format_com_error(exc),
+                })
+    after = _content_inventory(background_view)
+    restored = all(
+        int(after.get("meaningful_counts", {}).get(name, 0))
+        == int(baseline.get("meaningful_counts", {}).get(name, 0))
+        for name in _BACKGROUND_COLLECTIONS
+    )
+    return {
+        "attempted": bool(results),
+        "results": results,
+        "rollback_verified": restored,
+        "after": after,
+    }
+
+
+def _restore_sheet_settings(
+    catia_app: Any,
+    target_sheet: Any,
+    before: Dict[str, Any],
+) -> Dict[str, Any]:
+    attempts: List[Dict[str, Any]] = []
+    verified = True
+    for name in ("PaperSize", "Orientation", "ProjectionMethod"):
+        value = before.get(name)
+        if value is None:
+            continue
+        result = _set_sheet_property(catia_app, target_sheet, name, int(value))
+        attempts.append({"property": name, "result": result})
+        verified = verified and bool(result["verified"])
+    requested_scale = before.get("Scale")
+    scale_result = {
+        "attempted": requested_scale is not None,
+        "verified": requested_scale is None,
+        "method": None,
+        "actual": _sheet_scale(target_sheet),
+        "errors": [],
+    }
+    if requested_scale is not None:
+        for name in ("Scale", "Scale2"):
+            try:
+                setattr(target_sheet, name, float(requested_scale))
+                actual = _sheet_scale(target_sheet)
+                ok = actual is not None and abs(actual - float(requested_scale)) <= 1e-9
+                if ok:
+                    scale_result.update({
+                        "verified": True,
+                        "method": name,
+                        "actual": actual,
+                    })
+                    break
+            except Exception as exc:
+                scale_result["errors"].append(_format_com_error(exc))
+        verified = verified and bool(scale_result["verified"])
+    return {
+        "attempted": True,
+        "verified": verified,
+        "property_attempts": attempts,
+        "scale": scale_result,
+    }
+
+
+
+def load_drawing_frame(
+    catia_app,
+    template_path: str,
+    replace_existing: bool = True,
+    sheet_index: Optional[int] = None,
+    apply_sheet_settings: bool = False,
+) -> Dict[str, Any]:
+    """Copy a verified template frame with paste-first replacement safety."""
+    raw_path = str(template_path).strip()
+    if not raw_path:
+        raise ValueError("template_path cannot be empty.")
+    path = os.path.abspath(os.path.expanduser(raw_path))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Template file not found: {path}")
+    if not path.lower().endswith(".catdrawing"):
+        raise ValueError("template_path must point to a .CATDrawing file.")
+
+    target_doc = _get_drawing_document(catia_app)
+    target_full_name = str(_safe_attr(target_doc, "FullName", ""))
+    if (
+        target_full_name
+        and _normalised_path_key(target_full_name) == _normalised_path_key(path)
+    ):
+        raise ValueError("Template and active target CATDrawing must differ.")
+
+    target_sheet, target_sheet_info = _resolve_sheet(target_doc, sheet_index)
+    target_background = _get_background_view(target_sheet)
+    target_counts_before = _content_inventory(target_background)
+    target_capture, target_capture_summary = _capture_meaningful_background_objects(
+        target_background
+    )
+    saved_before = _document_saved(target_doc)
+
+    template_doc = _find_open_document(catia_app, path)
+    opened_by_tool = template_doc is None
+    if template_doc is None:
+        template_doc = catia_app.Documents.Open(path)
+
+    lifecycle = {
+        "opened_by_tool": opened_by_tool,
+        "policy": "close_if_opened_by_tool_preserve_if_preexisting",
+        "cleanup": None,
+        "target_restore": None,
+    }
+    warnings: List[str] = []
+
+    try:
+        template_activation = _activate_document(template_doc)
+        template_sheet, template_sheet_info = _resolve_sheet(template_doc, 1)
+        template_background = _get_background_view(template_sheet)
+        template_view_activation = _activate_view(template_background)
+        template_counts = _content_inventory(template_background)
+        template_preflight = {
+            "verified_nonempty": bool(template_counts["has_meaningful_content"]),
+            "inventory": template_counts,
+            "performed_before_target_mutation": True,
+        }
+        if not template_preflight["verified_nonempty"]:
+            raise ToolOperationError(
+                "Template Background View contains no meaningful user/template "
+                "content. Target CATDrawing was not modified.",
+                data={
+                    "template_preflight": template_preflight,
+                    "template_lifecycle": lifecycle,
+                    "model_modified": False,
+                    "document_save_required": False,
+                },
+            )
+
+        template_projection = _detect_projection_method(catia_app, template_sheet)
+        template_paper = _paper_dimensions(catia_app, template_sheet)
+        copy_result = _copy_background_contents(template_doc, template_background)
+
+        target_activation = _activate_document(target_doc)
+        target_view_activation = _activate_view(target_background)
+        counts_before_paste = _content_inventory(target_background)
+        paste_result = _paste_background_contents(target_doc, target_background)
+        if not paste_result["succeeded"]:
+            counts_after_failed_paste = _content_inventory(target_background)
+            partial_delta = (
+                int(counts_after_failed_paste["meaningful_total_objects"])
+                - int(counts_before_paste["meaningful_total_objects"])
+            )
+            paste_rollback = (
+                _rollback_added_background_objects(
+                    target_doc, target_background, counts_before_paste
+                )
+                if partial_delta > 0
+                else {
+                    "attempted": False,
+                    "results": [],
+                    "rollback_verified": True,
+                    "after": counts_after_failed_paste,
+                }
+            )
+            restored = bool(paste_rollback["rollback_verified"])
+            raise ToolOperationError(
+                "Template Copy succeeded, but Paste into target Background View "
+                "failed before any existing target content was deleted.",
+                data={
+                    "copy_result": copy_result,
+                    "paste_result": paste_result,
+                    "counts_before_paste": counts_before_paste,
+                    "counts_after_failed_paste": counts_after_failed_paste,
+                    "partial_added_count": partial_delta,
+                    "paste_rollback": paste_rollback,
+                    "target_snapshot": target_capture_summary,
+                    "template_lifecycle": lifecycle,
+                    "model_modified": not restored,
+                    "document_save_required": not restored,
+                    "replacement_policy": "paste_then_delete_preexisting",
+                },
+                status="error" if restored else "partial_success",
+            )
+
+        paste_update_attempts, paste_update_warnings = _update_drawing(
+            target_doc, target_sheet
+        )
+        warnings.extend(paste_update_warnings)
+        counts_after_paste = _content_inventory(target_background)
+        paste_verification = _paste_delta_verification(
+            copy_result, counts_before_paste, counts_after_paste
+        )
+        if not paste_verification["verified"]:
+            rollback = _rollback_added_background_objects(
+                target_doc, target_background, counts_before_paste
+            )
+            raise ToolOperationError(
+                "Paste returned without error, but the complete copied-content "
+                "delta could not be verified.",
+                data={
+                    "template_counts": template_counts,
+                    "target_counts_before": target_counts_before,
+                    "counts_before_paste": counts_before_paste,
+                    "counts_after_paste": counts_after_paste,
+                    "paste_verification": paste_verification,
+                    "copy_result": copy_result,
+                    "paste_result": paste_result,
+                    "paste_rollback": rollback,
+                    "template_lifecycle": lifecycle,
+                    "model_modified": not rollback["rollback_verified"],
+                    "document_save_required": not rollback["rollback_verified"],
+                    "replacement_policy": "paste_then_delete_preexisting",
+                },
+                status=(
+                    "error" if rollback["rollback_verified"] else "partial_success"
+                ),
+            )
+
+        settings_result = None
+        settings_rollback = None
+        if apply_sheet_settings:
+            settings_result = _apply_template_settings(
+                catia_app, target_sheet, template_sheet
+            )
+            if not settings_result["verified"]:
+                paste_rollback = _rollback_added_background_objects(
+                    target_doc, target_background, counts_before_paste
+                )
+                settings_rollback = _restore_sheet_settings(
+                    catia_app, target_sheet, settings_result.get("before", {})
+                )
+                restored = bool(
+                    paste_rollback["rollback_verified"]
+                    and settings_rollback["verified"]
+                )
+                raise ToolOperationError(
+                    "Template sheet settings failed readback verification. "
+                    "Pasted content and changed settings were rolled back where "
+                    "possible; existing target frame content was never deleted.",
+                    data={
+                        "sheet_settings": settings_result,
+                        "sheet_settings_rollback": settings_rollback,
+                        "paste_rollback": paste_rollback,
+                        "template_lifecycle": lifecycle,
+                        "model_modified": not restored,
+                        "document_save_required": not restored,
+                        "replacement_policy": "paste_then_delete_preexisting",
+                    },
+                    status="error" if restored else "partial_success",
+                )
+
+        clear_result = {
+            "attempted": False,
+            "succeeded": True,
+            "reason": "replace_existing=false",
+            "strategy": "none",
+        }
+        if replace_existing:
+            clear_result = _delete_captured_background_objects(
+                target_doc, target_background, target_capture
+            )
+            if not clear_result["succeeded"]:
+                raise ToolOperationError(
+                    "Template content was pasted and verified, but one or more "
+                    "preexisting target objects could not be deleted. Existing "
+                    "content was preserved rather than risking data loss.",
+                    data={
+                        "clear_result": clear_result,
+                        "copy_result": copy_result,
+                        "paste_result": paste_result,
+                        "paste_verification": paste_verification,
+                        "sheet_settings": settings_result,
+                        "template_lifecycle": lifecycle,
+                        "model_modified": True,
+                        "document_save_required": True,
+                        "replacement_policy": "paste_then_delete_preexisting",
+                    },
+                    status="partial_success",
+                )
+
+        final_update_attempts, final_update_warnings = _update_drawing(
+            target_doc, target_sheet
+        )
+        warnings.extend(final_update_warnings)
+        target_counts_after = _content_inventory(target_background)
+
+        return _success({
+            "operation": "load_drawing_frame",
+            "template": {
+                "path": path,
+                "document_name": str(_safe_attr(template_doc, "Name", "")),
+                "opened_by_tool": opened_by_tool,
+                "activation": template_activation,
+                "sheet": template_sheet_info,
+                "background_view": _background_info(template_background),
+                "background_activation": template_view_activation,
+                "content_counts": template_counts,
+                "paper": template_paper,
+                "projection": template_projection,
+                "has_title_block_text": bool(int(template_counts.get("Texts") or 0) > 0),
+            },
+            "target": {
+                "document_name": str(_safe_attr(target_doc, "Name", "")),
+                "document_full_name": target_full_name,
+                "activation": target_activation,
+                "sheet": target_sheet_info,
+                "background_view": _background_info(target_background),
+                "background_activation": target_view_activation,
+                "counts_before_operation": target_counts_before,
+                "counts_before_paste": counts_before_paste,
+                "counts_after_paste": counts_after_paste,
+                "counts_after": target_counts_after,
+                "paper": _paper_dimensions(catia_app, target_sheet),
+                "projection": _detect_projection_method(catia_app, target_sheet),
+            },
+            "replace_existing": bool(replace_existing),
+            "apply_sheet_settings": bool(apply_sheet_settings),
+            "sheet_settings": settings_result,
+            "sheet_settings_rollback": settings_rollback,
+            "template_preflight": template_preflight,
+            "target_snapshot": target_capture_summary,
+            "copy_result": copy_result,
+            "paste_result": paste_result,
+            "paste_verification": paste_verification,
+            "paste_verified": True,
+            "clear_result": clear_result,
+            "replacement_policy": "paste_then_delete_preexisting",
+            "existing_content_deleted_only_after_verified_paste": True,
+            "paste_update_attempts": paste_update_attempts,
+            "final_update_attempts": final_update_attempts,
+            "template_lifecycle": lifecycle,
+            "model_modified": True,
+            "document_save_required": True,
+            "document_saved_before": saved_before,
+            "document_saved_after": _document_saved(target_doc),
+        }, warnings)
+    finally:
+        if opened_by_tool:
+            lifecycle["cleanup"] = _close_document(
+                template_doc, discard_unsaved_changes=False
+            )
+        else:
+            lifecycle["cleanup"] = {
+                "attempted": False,
+                "succeeded": True,
+                "reason": "preexisting user template document preserved",
+            }
+        lifecycle["target_restore"] = _activate_document(target_doc)
+
+
+
+def detect_projection_standard(
+    catia_app,
+    sheet_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Detect projection standard for the selected sheet."""
+    doc = _get_drawing_document(catia_app)
+    sheet, sheet_info = _resolve_sheet(
+        doc,
+        sheet_index,
+    )
+    projection = _detect_projection_method(
+        catia_app,
+        sheet,
+    )
+    warnings: List[str] = []
+    if not projection["verified"]:
+        warnings.append(
+            "Projection could not be classified as "
+            "first-angle or third-angle."
+        )
+    return _success({
+        "operation": "detect_projection_standard",
+        "projection": projection,
+        "sheet": sheet_info,
+        "paper": _paper_dimensions(catia_app, sheet),
+        "coordinate_unit": "mm",
+        "model_modified": False,
+        "document_save_required": False,
+        "document_saved": _document_saved(doc),
+    }, warnings)
+
+
+# ---------------------------------------------------------------------------
+# Registry Entry Point (Required by registry.py)
+# ---------------------------------------------------------------------------
+
+def register_tools(mcp: Any, ctx: Any) -> list[str]:
+    """Register drawing-template tools using the project-standard decorator format."""
+
+    conn = ctx.conn
+    names: list[str] = []
+
+    # Resolve module-level implementations explicitly because the nested MCP
+    # wrapper functions intentionally use the public tool names.
+    get_title_block_properties_impl = globals()[
+        "get_title_block_properties"
+    ]
+    set_title_block_properties_impl = globals()[
+        "set_title_block_properties"
+    ]
+    load_drawing_frame_impl = globals()["load_drawing_frame"]
+    detect_projection_standard_impl = globals()[
+        "detect_projection_standard"
+    ]
+
+    @mcp.tool()
+    def get_title_block_properties(
+        sheet_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Read verified title-block fields from a CATDrawing sheet."""
+        try:
+            catia_app = conn.connect(visible=True)
+            return get_title_block_properties_impl(
+                catia_app,
+                sheet_index=sheet_index,
+            )
+        except ToolOperationError as exc:
+            return _error(
+                str(exc),
+                data=exc.data,
+                warnings=exc.warnings,
+                status=exc.status,
+            )
+        except Exception as exc:
+            return _error(_format_com_error(exc))
+
+    names.append("get_title_block_properties")
+
+    @mcp.tool()
+    def set_title_block_properties(
+        properties: Dict[str, str],
+        sheet_index: Optional[int] = None,
+        create_if_missing: bool = False,
+        require_unique: bool = True,
+        base_x_mm: Optional[float] = None,
+        base_y_mm: Optional[float] = None,
+        row_spacing_mm: float = 7.0,
+        sheet_margin_mm: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Update or create verified title-block DrawingText fields."""
+        try:
+            catia_app = conn.connect(visible=True)
+            return set_title_block_properties_impl(
+                catia_app,
+                properties=properties,
+                sheet_index=sheet_index,
+                create_if_missing=create_if_missing,
+                require_unique=require_unique,
+                base_x_mm=base_x_mm,
+                base_y_mm=base_y_mm,
+                row_spacing_mm=row_spacing_mm,
+                sheet_margin_mm=sheet_margin_mm,
+            )
+        except ToolOperationError as exc:
+            return _error(
+                str(exc),
+                data=exc.data,
+                warnings=exc.warnings,
+                status=exc.status,
+            )
+        except Exception as exc:
+            return _error(_format_com_error(exc))
+
+    names.append("set_title_block_properties")
+
+    @mcp.tool()
+    def load_drawing_frame(
+        template_path: str,
+        replace_existing: bool = True,
+        sheet_index: Optional[int] = None,
+        apply_sheet_settings: bool = False,
+    ) -> Dict[str, Any]:
+        """Copy a verified CATDrawing template frame into the target sheet."""
+        try:
+            catia_app = conn.connect(visible=True)
+            return load_drawing_frame_impl(
+                catia_app,
+                template_path=template_path,
+                replace_existing=replace_existing,
+                sheet_index=sheet_index,
+                apply_sheet_settings=apply_sheet_settings,
+            )
+        except ToolOperationError as exc:
+            return _error(
+                str(exc),
+                data=exc.data,
+                warnings=exc.warnings,
+                status=exc.status,
+            )
+        except Exception as exc:
+            return _error(_format_com_error(exc))
+
+    names.append("load_drawing_frame")
+
+    @mcp.tool()
+    def detect_projection_standard(
+        sheet_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Detect first-angle or third-angle projection for a sheet."""
+        try:
+            catia_app = conn.connect(visible=True)
+            return detect_projection_standard_impl(
+                catia_app,
+                sheet_index=sheet_index,
+            )
+        except ToolOperationError as exc:
+            return _error(
+                str(exc),
+                data=exc.data,
+                warnings=exc.warnings,
+                status=exc.status,
+            )
+        except Exception as exc:
+            return _error(_format_com_error(exc))
+
+    names.append("detect_projection_standard")
+
+    return names

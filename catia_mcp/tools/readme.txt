@@ -1,0 +1,9 @@
+hybrid_shape用于创建点和偏置面
+assembly用于添加CATPart；添加CATProduct；读取组件列表；读取位置；平移组件
+measurement用于读取CATPart参数；修改参数尺寸；计算体积、质量、面积、重心；测量两个几何元素距离
+export用于导出CAD文件；截图；自动缩放显示全部模型；切换观察方向
+drafting用于从CATPart/CATProduct文件生成三视图工程图；从当前打开模型生成工程图；自动生成尺寸标注；添加工程图文字；添加标题栏；添加工程备注；添加GD&T形位公差说明；保存CATDrawing；导出PDF/DWG/DXF
+product_modeling用于这个tools有什么功能；创建圆角矩形板；创建带孔矩形板
+part_design用于草图拉伸成实体；草图切除材料；创建圆柱凸台；切圆孔；旋转生成实体；旋转切除；查看特征树；更新模型
+sketcher用于创建并打开草图；关闭草图；画直线；画矩形；画中心矩形；画圆；创建点；画圆角矩形；画圆弧；读取草图元素
+document用于启动/连接CATIA；查看连接状态；断开连接；创建CATPart；创建CATProduct；创建CATDrawing；打开文件；保存文件；关闭文件；列出打开文件；获取当前文件信息

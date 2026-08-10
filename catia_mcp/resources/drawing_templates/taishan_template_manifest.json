@@ -1,0 +1,19 @@
+{
+  "template_family": "TAISHAN drawing frame/title block",
+  "source_uploaded_name": "TAISHAN BOTTOM COVER-DELETE.CATDrawing",
+  "source_sha256": "95b448e3b088971b0189b41fb286ec06394e6bc7e6718445d80af3e0046d9b52",
+  "source_size_bytes": 628183,
+  "catia_version_strings": [
+    "V5R32SP6HF0",
+    "CATIAV5R32"
+  ],
+  "static_preview_indicates_frame_and_title_block": true,
+  "plain_text_catpart_reference_found": false,
+  "plain_text_catproduct_reference_found": false,
+  "stale_product_specific_metadata_detected": true,
+  "runtime_base_filename": "TAISHAN_STANDARD_A3_LANDSCAPE.CATDrawing",
+  "runtime_base_sha256": "95b448e3b088971b0189b41fb286ec06394e6bc7e6718445d80af3e0046d9b52",
+  "runtime_base_state": "exact source copy; create_drawing_from_template sanitises each output copy by default",
+  "verified_clean_template_generation": "Run create_clean_drawing_template inside CATIA V5, then audit_drawing_template and require clean_for_reuse=true.",
+  "honesty_note": "A proprietary CATDrawing cannot be safely rewritten or CATIA-object-audited in this Linux container. The packaged CATDrawing is therefore not claimed to be CATIA-verified clean before the one-time runtime sanitisation."
+}

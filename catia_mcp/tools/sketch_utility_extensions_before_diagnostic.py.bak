@@ -1,0 +1,1475 @@
+"""
+sketch_utility_extensions.py
+============================
+
+CATIA V5 MCP sketch utility tools.
+
+The CATIA V5 Factory2D Automation interface exposes primitive-creation methods,
+but it does not expose CreateSymmetry, CreateTrim, CreateTranslate, or
+CreateRotate.  These tools therefore read the source geometry, calculate the
+required 2D transformation, and reconstruct supported geometry with Factory2D.
+
+Supported source geometry:
+- Point2D
+- Line2D / finite line segment
+- Circle2D closed circle
+- Circle2D arc
+
+Trim and extend currently support line-to-line operations only.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
+# CatConstraintType values verified against the CATIA V5 Automation enum.
+_CAT_CST_TYPE_ON = 2
+_CAT_CST_TYPE_SYMMETRY = 15
+
+_EPSILON = 1.0e-9
+_ANGLE_EPSILON = 1.0e-8
+
+
+@dataclass
+class SketchOperationResult:
+    """Structured result returned by every sketch utility operation."""
+
+    operation: str = ""
+    status: str = "success"
+    elements_created: int = 0
+    elements_modified: int = 0
+    originals_deleted: int = 0
+    constraints_added: int = 0
+    constraints_removed: int = 0
+    constraint_status: str = "unknown"
+    element_names: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
+    sketch_closed: bool = False
+    update_succeeded: bool = False
+    document_unit: str = "mm"
+
+
+@dataclass(frozen=True)
+class GeometrySnapshot:
+    """COM-independent representation of supported 2D sketch geometry."""
+
+    kind: str
+    name: str
+    data: Dict[str, Any]
+
+
+def _result_dict(result: SketchOperationResult) -> Dict[str, Any]:
+    return asdict(result)
+
+
+def _normalise_text(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _coerce_vector(value: Any, expected_size: int) -> Tuple[float, ...] | None:
+    """Convert COM/VARIANT/nested sequence output into a finite float tuple."""
+
+    if value is None:
+        return None
+
+    # win32com.client.VARIANT exposes the wrapped SAFEARRAY through ``value``.
+    if hasattr(value, "value"):
+        try:
+            value = value.value
+        except Exception:
+            pass
+
+    if isinstance(value, (list, tuple)):
+        # First prefer a flat sequence containing the requested values.
+        if len(value) >= expected_size:
+            try:
+                candidate = tuple(float(value[index]) for index in range(expected_size))
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and all(math.isfinite(item) for item in candidate):
+                return candidate
+
+        # Generated COM wrappers sometimes nest the out-array in another tuple,
+        # or return additional values beside it. Search nested members safely.
+        for item in value:
+            nested = _coerce_vector(item, expected_size)
+            if nested is not None:
+                return nested
+
+    return None
+
+
+def _read_out_array(obj: Any, method_name: str, expected_size: int) -> Tuple[float, ...]:
+    """
+    Read a CATSafeArrayVariant output across common pywin32 dispatch modes.
+
+    A critical rule is that a caller-owned output buffer is accepted only when
+    CATIA actually overwrote its sentinel values.  The previous implementation
+    initialized buffers with zeros and accepted the unchanged buffer after a
+    no-op COM call, which could turn every line into ``(0, 0, 0, 0)``.
+    """
+
+    method = getattr(obj, method_name)
+    errors: List[str] = []
+
+    def _accept(value: Any, source: str) -> Tuple[float, ...] | None:
+        values = _coerce_vector(value, expected_size)
+        if values is not None:
+            return values
+        if value is not None:
+            errors.append(f"{source}: unusable return {value!r}")
+        return None
+
+    # makepy-generated wrappers normally expose CATSafeArrayVariant out values
+    # as the Python return value.
+    try:
+        values = _accept(method(), "direct call")
+        if values is not None:
+            return values
+    except Exception as exc:
+        errors.append(f"direct call: {exc}")
+
+    # If the object is dynamic-dispatch, try to cast it to the corresponding
+    # generated CATIA interface before falling back to an explicit VARIANT.
+    interface_candidates = {
+        "GetCoordinates": ("Point2D",),
+        "GetEndPoints": ("Curve2D",),
+        "GetParamExtents": ("Curve2D",),
+        "GetCenter": ("Circle2D", "Ellipse2D"),
+    }.get(method_name, ())
+
+    if interface_candidates:
+        try:
+            from win32com.client import CastTo  # type: ignore
+
+            for interface_name in interface_candidates:
+                try:
+                    casted = CastTo(obj, interface_name)
+                    cast_method = getattr(casted, method_name)
+                    values = _accept(
+                        cast_method(),
+                        f"CastTo({interface_name})",
+                    )
+                    if values is not None:
+                        return values
+                except Exception as exc:
+                    errors.append(f"CastTo({interface_name}): {exc}")
+        except Exception as exc:
+            errors.append(f"CastTo unavailable: {exc}")
+
+    # Dynamic-dispatch objects do not always know that the SAFEARRAY is an out
+    # parameter. Supply an explicit by-reference VARIANT. NaN sentinels let us
+    # distinguish a real all-zero CATIA result from an untouched output buffer.
+    try:
+        import pythoncom  # type: ignore
+        from win32com.client import VARIANT  # type: ignore
+
+        variant_types = (
+            pythoncom.VT_BYREF | pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            pythoncom.VT_BYREF | pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
+        )
+        for variant_type in variant_types:
+            try:
+                sentinel = [float("nan")] * expected_size
+                buffer = VARIANT(variant_type, sentinel)
+                returned = method(buffer)
+
+                values = _accept(returned, f"VARIANT return {variant_type}")
+                if values is not None:
+                    return values
+
+                values = _coerce_vector(buffer, expected_size)
+                if values is not None:
+                    return values
+
+                errors.append(
+                    f"VARIANT buffer {variant_type} was not populated by CATIA"
+                )
+            except Exception as exc:
+                errors.append(f"VARIANT call {variant_type}: {exc}")
+    except Exception as exc:
+        errors.append(f"VARIANT unavailable: {exc}")
+
+    # Last-resort path for wrappers that mutate a normal Python list. Again use
+    # NaN sentinels so an unchanged seed can never be reported as valid geometry.
+    try:
+        seed = [float("nan")] * expected_size
+        returned = method(seed)
+        values = _accept(returned, "mutable-sequence return")
+        if values is not None:
+            return values
+        values = _coerce_vector(seed, expected_size)
+        if values is not None:
+            return values
+        errors.append("mutable-sequence buffer was not populated by CATIA")
+    except Exception as exc:
+        errors.append(f"mutable-sequence call: {exc}")
+
+    detail = "; ".join(errors[-8:])
+    raise RuntimeError(
+        f"{method_name} did not return {expected_size} numeric value(s). {detail}"
+    )
+
+def _get_point_coordinates(point: Any) -> Tuple[float, float]:
+    values = _read_out_array(point, "GetCoordinates", 2)
+    return values[0], values[1]
+
+
+def _set_point_coordinates(point: Any, x_value: float, y_value: float) -> None:
+    """Point2D coordinates are modified with SetData, not SetCoordinates."""
+
+    point.SetData(float(x_value), float(y_value))
+
+
+def _get_curve_endpoints(curve: Any) -> Tuple[float, float, float, float]:
+    try:
+        values = _read_out_array(curve, "GetEndPoints", 4)
+        return values[0], values[1], values[2], values[3]
+    except Exception as primary_error:
+        try:
+            start_x, start_y = _get_point_coordinates(curve.StartPoint)
+            end_x, end_y = _get_point_coordinates(curve.EndPoint)
+            return start_x, start_y, end_x, end_y
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Cannot read curve endpoints. "
+                f"GetEndPoints failed: {primary_error}; "
+                f"StartPoint/EndPoint failed: {fallback_error}"
+            ) from fallback_error
+
+
+def _get_circle_center(circle: Any) -> Tuple[float, float]:
+    try:
+        values = _read_out_array(circle, "GetCenter", 2)
+        return values[0], values[1]
+    except Exception as primary_error:
+        try:
+            return _get_point_coordinates(circle.CenterPoint)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Cannot read circle center. "
+                f"GetCenter failed: {primary_error}; "
+                f"CenterPoint failed: {fallback_error}"
+            ) from fallback_error
+
+
+def _get_curve_param_extents(curve: Any) -> Tuple[float, float] | None:
+    try:
+        values = _read_out_array(curve, "GetParamExtents", 2)
+        return values[0], values[1]
+    except Exception:
+        return None
+
+
+def _get_element_name(element: Any, fallback: str = "") -> str:
+    try:
+        value = str(element.Name).strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return fallback
+
+
+def _is_periodic_curve(curve: Any) -> bool:
+    try:
+        return bool(curve.IsPeriodic())
+    except Exception:
+        return False
+
+
+def _snapshot_geometry(element: Any, fallback_name: str = "") -> GeometrySnapshot:
+    """
+    Read a supported sketch element without creating helper geometry.
+
+    Detection order is important: circles/arcs also inherit Curve2D and expose
+    endpoints, so circle data must be checked before generic line data.
+    """
+
+    name = _get_element_name(element, fallback_name)
+
+    # Circle or circular arc.
+    try:
+        radius = float(element.Radius)
+        center_x, center_y = _get_circle_center(element)
+        params = _get_curve_param_extents(element)
+        periodic = _is_periodic_curve(element)
+
+        if periodic:
+            return GeometrySnapshot(
+                kind="circle",
+                name=name,
+                data={"center": (center_x, center_y), "radius": radius},
+            )
+
+        endpoints = _get_curve_endpoints(element)
+        start_point = (endpoints[0], endpoints[1])
+        end_point = (endpoints[2], endpoints[3])
+
+        if params is not None:
+            sweep = float(params[1] - params[0])
+            while sweep <= 0.0:
+                sweep += 2.0 * math.pi
+        else:
+            start_angle = math.atan2(start_point[1] - center_y, start_point[0] - center_x)
+            end_angle = math.atan2(end_point[1] - center_y, end_point[0] - center_x)
+            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+
+        # A periodic flag is not always available through dynamic dispatch.
+        if sweep >= 2.0 * math.pi - _ANGLE_EPSILON:
+            return GeometrySnapshot(
+                kind="circle",
+                name=name,
+                data={"center": (center_x, center_y), "radius": radius},
+            )
+
+        if sweep <= _ANGLE_EPSILON:
+            raise RuntimeError(f"Arc '{name}' has an invalid zero sweep.")
+
+        return GeometrySnapshot(
+            kind="arc",
+            name=name,
+            data={
+                "center": (center_x, center_y),
+                "radius": radius,
+                "start_point": start_point,
+                "end_point": end_point,
+                "sweep": sweep,
+            },
+        )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
+    # Finite line. A missing Curve2D interface means the element may be a point,
+    # so endpoint-read failures must fall through to Point2D detection.
+    line_endpoints: Tuple[float, float, float, float] | None = None
+    try:
+        line_endpoints = _get_curve_endpoints(element)
+    except Exception:
+        line_endpoints = None
+
+    if line_endpoints is not None:
+        x1, y1, x2, y2 = line_endpoints
+        if math.hypot(x2 - x1, y2 - y1) <= _EPSILON:
+            raise RuntimeError(f"Line '{name}' has zero length.")
+        return GeometrySnapshot(
+            kind="line",
+            name=name,
+            data={"start": (x1, y1), "end": (x2, y2)},
+        )
+
+    # Standalone point.
+    try:
+        point_x, point_y = _get_point_coordinates(element)
+        return GeometrySnapshot(
+            kind="point",
+            name=name,
+            data={"point": (point_x, point_y)},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unsupported sketch geometry '{name or fallback_name}'. "
+            "Supported types are Point2D, Line2D, Circle2D, and circular arcs."
+        ) from exc
+
+
+def _normalise_arc_start(angle: float) -> float:
+    return float(angle % (2.0 * math.pi))
+
+
+def _create_from_snapshot(
+    factory2d: Any,
+    snapshot: GeometrySnapshot,
+    transform: Callable[[float, float], Tuple[float, float]],
+    orientation_reversed: bool = False,
+) -> Any:
+    """Create one transformed copy from a geometry snapshot."""
+
+    if snapshot.kind == "point":
+        point_x, point_y = transform(*snapshot.data["point"])
+        return factory2d.CreatePoint(point_x, point_y)
+
+    if snapshot.kind == "line":
+        start_x, start_y = transform(*snapshot.data["start"])
+        end_x, end_y = transform(*snapshot.data["end"])
+        if math.hypot(end_x - start_x, end_y - start_y) <= _EPSILON:
+            raise RuntimeError(f"Transformed line '{snapshot.name}' has zero length.")
+        return factory2d.CreateLine(start_x, start_y, end_x, end_y)
+
+    if snapshot.kind == "circle":
+        center_x, center_y = transform(*snapshot.data["center"])
+        return factory2d.CreateClosedCircle(
+            center_x,
+            center_y,
+            float(snapshot.data["radius"]),
+        )
+
+    if snapshot.kind == "arc":
+        center_x, center_y = transform(*snapshot.data["center"])
+        sweep = float(snapshot.data["sweep"])
+
+        # Reflection reverses curve orientation.  Swapping transformed endpoints
+        # preserves the same arc locus while satisfying CATIA's CCW parameters.
+        source_start = snapshot.data["start_point"]
+        source_end = snapshot.data["end_point"]
+        if orientation_reversed:
+            start_x, start_y = transform(*source_end)
+        else:
+            start_x, start_y = transform(*source_start)
+
+        start_angle = _normalise_arc_start(
+            math.atan2(start_y - center_y, start_x - center_x)
+        )
+        end_angle = start_angle + sweep
+        return factory2d.CreateCircle(
+            center_x,
+            center_y,
+            float(snapshot.data["radius"]),
+            start_angle,
+            end_angle,
+        )
+
+    raise RuntimeError(f"Unsupported snapshot kind: {snapshot.kind}")
+
+
+def _get_sketch_in_edit(
+    catia_app: Any,
+    sketch_name: str,
+) -> Tuple[Any, Any, Any, Any]:
+    """Find a named sketch in the active CATPart and open its edition."""
+
+    if not str(sketch_name).strip():
+        raise RuntimeError("sketch_name cannot be empty.")
+
+    try:
+        doc = catia_app.ActiveDocument
+    except Exception as exc:
+        raise RuntimeError("No active CATIA document.") from exc
+
+    try:
+        document_name = str(doc.Name)
+    except Exception:
+        document_name = ""
+
+    if not document_name.lower().endswith(".catpart"):
+        raise RuntimeError("Active document must be a CATPart for sketch operations.")
+
+    try:
+        part = doc.Part
+    except Exception as exc:
+        raise RuntimeError("Cannot access Part from the active CATPart.") from exc
+
+    try:
+        doc.Selection.Clear()
+    except Exception:
+        pass
+
+    sketch = None
+
+    try:
+        bodies = part.Bodies
+        for body_index in range(1, int(bodies.Count) + 1):
+            body = bodies.Item(body_index)
+            try:
+                sketch = body.Sketches.Item(sketch_name)
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if sketch is None:
+        try:
+            hybrid_bodies = part.HybridBodies
+            for body_index in range(1, int(hybrid_bodies.Count) + 1):
+                hybrid_body = hybrid_bodies.Item(body_index)
+                try:
+                    sketch = hybrid_body.HybridSketches.Item(sketch_name)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if sketch is None:
+        raise RuntimeError(
+            f"Sketch '{sketch_name}' was not found in the active CATPart."
+        )
+
+    try:
+        factory2d = sketch.OpenEdition()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot open sketch '{sketch_name}' for editing: {exc}"
+        ) from exc
+
+    return sketch, factory2d, part, doc
+
+
+def _close_sketch(
+    sketch: Any,
+    part: Any,
+) -> Tuple[bool, bool, List[str]]:
+    """Close sketch edition, then update the sketch after it is closed."""
+
+    warnings: List[str] = []
+    closed = False
+    updated = False
+
+    try:
+        sketch.CloseEdition()
+        closed = True
+    except Exception as exc:
+        warnings.append(f"Sketch CloseEdition failed: {exc}")
+        return closed, updated, warnings
+
+    try:
+        part.UpdateObject(sketch)
+        updated = True
+    except Exception as update_object_error:
+        try:
+            part.Update()
+            updated = True
+        except Exception as update_error:
+            warnings.append(
+                "Part update after sketch close failed: "
+                f"UpdateObject={update_object_error}; Update={update_error}"
+            )
+
+    return closed, updated, warnings
+
+
+def _get_element_by_name(sketch: Any, name: str) -> Any:
+    element_name = str(name).strip()
+    if not element_name:
+        raise RuntimeError("Sketch element name cannot be empty.")
+
+    try:
+        return sketch.GeometricElements.Item(element_name)
+    except Exception as direct_error:
+        # CATIA names may be localised; preserve an exact case-insensitive fallback.
+        try:
+            elements = sketch.GeometricElements
+            for index in range(1, int(elements.Count) + 1):
+                candidate = elements.Item(index)
+                if _get_element_name(candidate).casefold() == element_name.casefold():
+                    return candidate
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Element '{element_name}' was not found in sketch."
+        ) from direct_error
+
+
+def _delete_elements(doc: Any, elements: Sequence[Any]) -> int:
+    if not elements:
+        return 0
+
+    selection = doc.Selection
+    selection.Clear()
+    added = 0
+    try:
+        for element in elements:
+            selection.Add(element)
+            added += 1
+        selection.Delete()
+        return added
+    finally:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+
+
+def _constraint_count(sketch: Any) -> int:
+    try:
+        return int(sketch.Constraints.Count)
+    except Exception:
+        return 0
+
+
+def _evaluate_sketch(sketch: Any) -> str:
+    try:
+        sketch.Evaluate()
+        return "evaluated"
+    except Exception:
+        return "unknown"
+
+
+def _line_intersection(
+    source: Tuple[float, float, float, float],
+    boundary: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    """Return intersection x/y plus parameters on source and boundary supports."""
+
+    x1, y1, x2, y2 = source
+    x3, y3, x4, y4 = boundary
+
+    source_dx = x2 - x1
+    source_dy = y2 - y1
+    boundary_dx = x4 - x3
+    boundary_dy = y4 - y3
+
+    denominator = source_dx * boundary_dy - source_dy * boundary_dx
+    if abs(denominator) <= _EPSILON:
+        raise RuntimeError("Source and boundary lines are parallel or coincident.")
+
+    delta_x = x3 - x1
+    delta_y = y3 - y1
+    source_parameter = (
+        delta_x * boundary_dy - delta_y * boundary_dx
+    ) / denominator
+    boundary_parameter = (
+        delta_x * source_dy - delta_y * source_dx
+    ) / denominator
+
+    intersection_x = x1 + source_parameter * source_dx
+    intersection_y = y1 + source_parameter * source_dy
+    return intersection_x, intersection_y, source_parameter, boundary_parameter
+
+
+def _reflect_transform(
+    axis_start: Tuple[float, float],
+    axis_end: Tuple[float, float],
+) -> Callable[[float, float], Tuple[float, float]]:
+    axis_x1, axis_y1 = axis_start
+    axis_x2, axis_y2 = axis_end
+    axis_dx = axis_x2 - axis_x1
+    axis_dy = axis_y2 - axis_y1
+    length_squared = axis_dx * axis_dx + axis_dy * axis_dy
+
+    if length_squared <= _EPSILON:
+        raise RuntimeError("Mirror axis has zero length.")
+
+    def reflect(point_x: float, point_y: float) -> Tuple[float, float]:
+        projection = (
+            (point_x - axis_x1) * axis_dx
+            + (point_y - axis_y1) * axis_dy
+        ) / length_squared
+        projected_x = axis_x1 + projection * axis_dx
+        projected_y = axis_y1 + projection * axis_dy
+        return 2.0 * projected_x - point_x, 2.0 * projected_y - point_y
+
+    return reflect
+
+
+def _translation_transform(
+    delta_x: float,
+    delta_y: float,
+) -> Callable[[float, float], Tuple[float, float]]:
+    def translate(point_x: float, point_y: float) -> Tuple[float, float]:
+        return point_x + delta_x, point_y + delta_y
+
+    return translate
+
+
+def _rotation_transform(
+    center_x: float,
+    center_y: float,
+    angle_rad: float,
+) -> Callable[[float, float], Tuple[float, float]]:
+    cosine = math.cos(angle_rad)
+    sine = math.sin(angle_rad)
+
+    def rotate(point_x: float, point_y: float) -> Tuple[float, float]:
+        delta_x = point_x - center_x
+        delta_y = point_y - center_y
+        return (
+            center_x + delta_x * cosine - delta_y * sine,
+            center_y + delta_x * sine + delta_y * cosine,
+        )
+
+    return rotate
+
+
+def mirror_sketch_geometry(
+    catia_app: Any,
+    sketch_name: str,
+    element_names: List[str],
+    axis_name: str,
+    copy: bool = True,
+) -> Dict[str, Any]:
+    """Mirror supported sketch geometry about a line in the same sketch."""
+
+    result = SketchOperationResult(operation="mirror_sketch_geometry")
+    sketch = factory2d = part = doc = None
+    created_elements: List[Any] = []
+
+    try:
+        if not element_names:
+            raise RuntimeError("element_names must contain at least one element.")
+        if any(not str(name).strip() for name in element_names):
+            raise RuntimeError("element_names cannot contain empty names.")
+        if str(axis_name).strip().casefold() in {
+            str(name).strip().casefold() for name in element_names
+        }:
+            raise RuntimeError("The mirror axis cannot also be a source element.")
+
+        sketch, factory2d, part, doc = _get_sketch_in_edit(catia_app, sketch_name)
+
+        axis_element = _get_element_by_name(sketch, axis_name)
+        axis_snapshot = _snapshot_geometry(axis_element, axis_name)
+        if axis_snapshot.kind != "line":
+            raise RuntimeError("axis_name must identify a Line2D element.")
+
+        reflect = _reflect_transform(
+            axis_snapshot.data["start"],
+            axis_snapshot.data["end"],
+        )
+
+        source_elements: List[Any] = []
+        source_snapshots: List[GeometrySnapshot] = []
+        for element_name in element_names:
+            source = _get_element_by_name(sketch, element_name)
+            source_elements.append(source)
+            source_snapshots.append(_snapshot_geometry(source, element_name))
+
+        # All source geometry is validated before the first CATIA modification.
+        try:
+            for snapshot in source_snapshots:
+                mirrored = _create_from_snapshot(
+                    factory2d,
+                    snapshot,
+                    reflect,
+                    orientation_reversed=True,
+                )
+                created_elements.append(mirrored)
+                result.element_names.append(
+                    _get_element_name(mirrored, f"Mirror_{snapshot.name}")
+                )
+        except Exception:
+            try:
+                _delete_elements(doc, created_elements)
+            except Exception as rollback_error:
+                result.warnings.append(f"Mirror rollback failed: {rollback_error}")
+            raise
+
+        result.elements_created = len(created_elements)
+
+        if copy:
+            try:
+                constraints = sketch.Constraints
+                for source, mirrored in zip(source_elements, created_elements):
+                    try:
+                        constraints.AddTriEltCst(
+                            _CAT_CST_TYPE_SYMMETRY,
+                            source,
+                            mirrored,
+                            axis_element,
+                        )
+                        result.constraints_added += 1
+                    except Exception as exc:
+                        result.warnings.append(
+                            "Mirrored geometry was created, but its symmetry "
+                            f"constraint could not be added: {exc}"
+                        )
+            except Exception as exc:
+                result.warnings.append(
+                    f"Cannot access sketch constraints for mirror relation: {exc}"
+                )
+        else:
+            constraints_before = _constraint_count(sketch)
+            try:
+                result.originals_deleted = _delete_elements(doc, source_elements)
+            except Exception as exc:
+                result.warnings.append(
+                    f"Mirrored copies were created, but source deletion failed: {exc}"
+                )
+            constraints_after = _constraint_count(sketch)
+            result.constraints_removed = max(0, constraints_before - constraints_after)
+
+        result.constraint_status = _evaluate_sketch(sketch)
+        result.status = (
+            "success" if not result.warnings else "success_with_warnings"
+        )
+
+    except Exception as exc:
+        result.status = "error"
+        result.warnings.append(str(exc))
+    finally:
+        if sketch is not None and part is not None:
+            closed, updated, close_warnings = _close_sketch(sketch, part)
+            result.sketch_closed = closed
+            result.update_succeeded = updated
+            result.warnings.extend(close_warnings)
+            if result.status == "success" and result.warnings:
+                result.status = "success_with_warnings"
+        if doc is not None:
+            try:
+                doc.Selection.Clear()
+            except Exception:
+                pass
+
+    return _result_dict(result)
+
+
+def trim_extend_sketch_element(
+    catia_app: Any,
+    sketch_name: str,
+    element_name: str,
+    boundary_name: str,
+    mode: str = "trim",
+    extend_side: str = "nearest",
+) -> Dict[str, Any]:
+    """
+    Trim or extend a finite line segment to another line's infinite support.
+
+    The selected source endpoint is moved with Point2D.SetData.  No nonexistent
+    Factory2D CreateTrim/CreateExtend method is called.
+    """
+
+    result = SketchOperationResult(operation="trim_extend_sketch_element")
+    sketch = factory2d = part = doc = None
+
+    try:
+        normalised_mode = _normalise_text(mode)
+        normalised_side = _normalise_text(extend_side)
+        if normalised_mode not in {"trim", "extend"}:
+            raise RuntimeError("mode must be 'trim' or 'extend'.")
+        if normalised_side not in {"start", "end", "nearest"}:
+            raise RuntimeError("extend_side must be 'start', 'end', or 'nearest'.")
+        if _normalise_text(element_name) == _normalise_text(boundary_name):
+            raise RuntimeError("element_name and boundary_name must be different.")
+
+        sketch, factory2d, part, doc = _get_sketch_in_edit(catia_app, sketch_name)
+        source = _get_element_by_name(sketch, element_name)
+        boundary = _get_element_by_name(sketch, boundary_name)
+
+        source_snapshot = _snapshot_geometry(source, element_name)
+        boundary_snapshot = _snapshot_geometry(boundary, boundary_name)
+        if source_snapshot.kind != "line":
+            raise RuntimeError("Trim/extend currently supports a Line2D source only.")
+        if boundary_snapshot.kind != "line":
+            raise RuntimeError("Trim/extend currently supports a Line2D boundary only.")
+
+        source_coords = (
+            source_snapshot.data["start"][0],
+            source_snapshot.data["start"][1],
+            source_snapshot.data["end"][0],
+            source_snapshot.data["end"][1],
+        )
+        boundary_coords = (
+            boundary_snapshot.data["start"][0],
+            boundary_snapshot.data["start"][1],
+            boundary_snapshot.data["end"][0],
+            boundary_snapshot.data["end"][1],
+        )
+        intersection_x, intersection_y, source_parameter, _ = _line_intersection(
+            source_coords,
+            boundary_coords,
+        )
+
+        if normalised_mode == "trim":
+            if source_parameter < -_EPSILON or source_parameter > 1.0 + _EPSILON:
+                raise RuntimeError(
+                    "The boundary does not intersect the finite source segment. "
+                    "Use mode='extend' instead."
+                )
+            if (
+                abs(source_parameter) <= _EPSILON
+                or abs(source_parameter - 1.0) <= _EPSILON
+            ):
+                raise RuntimeError("Source endpoint already lies on the boundary.")
+
+            if normalised_side == "start":
+                endpoint_name = "start"
+            elif normalised_side == "end":
+                endpoint_name = "end"
+            else:
+                endpoint_name = (
+                    "start" if source_parameter <= 0.5 else "end"
+                )
+        else:
+            if -_EPSILON <= source_parameter <= 1.0 + _EPSILON:
+                raise RuntimeError(
+                    "The boundary intersects the existing source segment. "
+                    "Use mode='trim' instead."
+                )
+
+            required_side = "start" if source_parameter < 0.0 else "end"
+            if normalised_side == "nearest":
+                endpoint_name = required_side
+            else:
+                endpoint_name = normalised_side
+                if endpoint_name != required_side:
+                    raise RuntimeError(
+                        f"Intersection lies beyond the {required_side} endpoint; "
+                        f"extend_side='{endpoint_name}' would not extend the line."
+                    )
+
+        endpoint = source.StartPoint if endpoint_name == "start" else source.EndPoint
+        original_x, original_y = _get_point_coordinates(endpoint)
+
+        try:
+            _set_point_coordinates(endpoint, intersection_x, intersection_y)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not move the source {endpoint_name} endpoint with Point2D.SetData: {exc}"
+            ) from exc
+
+        result.elements_modified = 1
+        result.element_names.append(_get_element_name(source, element_name))
+
+        try:
+            sketch.Constraints.AddBiEltCst(
+                _CAT_CST_TYPE_ON,
+                endpoint,
+                boundary,
+            )
+            result.constraints_added += 1
+        except Exception as exc:
+            result.warnings.append(
+                "Geometry was modified, but the endpoint-on-boundary constraint "
+                f"could not be added: {exc}"
+            )
+
+        result.constraint_status = _evaluate_sketch(sketch)
+
+        # Confirm that the endpoint retained the requested coordinates.
+        try:
+            confirmed_x, confirmed_y = _get_point_coordinates(endpoint)
+            if math.hypot(
+                confirmed_x - intersection_x,
+                confirmed_y - intersection_y,
+            ) > 1.0e-6:
+                result.warnings.append(
+                    "CATIA solver changed the moved endpoint after evaluation."
+                )
+        except Exception as exc:
+            result.warnings.append(
+                f"Endpoint coordinate verification failed after modification: {exc}"
+            )
+
+        result.details.update(
+            {
+                "mode": normalised_mode,
+                "moved_endpoint": endpoint_name,
+                "original_coordinates": [original_x, original_y],
+                "intersection_coordinates": [intersection_x, intersection_y],
+                "source_parameter": source_parameter,
+            }
+        )
+        result.status = (
+            "success" if not result.warnings else "success_with_warnings"
+        )
+
+    except Exception as exc:
+        result.status = "error"
+        result.warnings.append(str(exc))
+    finally:
+        if sketch is not None and part is not None:
+            closed, updated, close_warnings = _close_sketch(sketch, part)
+            result.sketch_closed = closed
+            result.update_succeeded = updated
+            result.warnings.extend(close_warnings)
+            if result.status == "success" and result.warnings:
+                result.status = "success_with_warnings"
+        if doc is not None:
+            try:
+                doc.Selection.Clear()
+            except Exception:
+                pass
+
+    return _result_dict(result)
+
+
+def pattern_sketch_elements(
+    catia_app: Any,
+    sketch_name: str,
+    element_names: List[str],
+    pattern_type: str = "rectangular",
+    count_x: int = 3,
+    count_y: int = 1,
+    spacing_x_mm: float = 20.0,
+    spacing_y_mm: float = 20.0,
+    circular_count: int = 6,
+    circular_radius_mm: float = 50.0,
+    center_x_mm: float = 0.0,
+    center_y_mm: float = 0.0,
+    angle_start_deg: float = 0.0,
+    angle_span_deg: float = 360.0,
+) -> Dict[str, Any]:
+    """
+    Reconstruct rectangular or circular copies of supported sketch geometry.
+
+    Counts include the original instance.  Therefore, a 3x2 rectangular pattern
+    creates five copies per source element, and a circular_count of four creates
+    three copies per source element.
+    """
+
+    del circular_radius_mm  # Kept in the MCP schema for backward compatibility.
+
+    result = SketchOperationResult(operation="pattern_sketch_elements")
+    sketch = factory2d = part = doc = None
+    created_elements: List[Any] = []
+
+    try:
+        normalised_pattern = _normalise_text(pattern_type)
+        if normalised_pattern not in {"rectangular", "circular"}:
+            raise RuntimeError("pattern_type must be 'rectangular' or 'circular'.")
+        if not element_names:
+            raise RuntimeError("element_names must contain at least one element.")
+        if any(not str(name).strip() for name in element_names):
+            raise RuntimeError("element_names cannot contain empty names.")
+
+        if normalised_pattern == "rectangular":
+            if not isinstance(count_x, int) or isinstance(count_x, bool):
+                raise RuntimeError("count_x must be an integer.")
+            if not isinstance(count_y, int) or isinstance(count_y, bool):
+                raise RuntimeError("count_y must be an integer.")
+            if count_x < 1 or count_y < 1:
+                raise RuntimeError("count_x and count_y must be at least 1.")
+            if count_x > 100 or count_y > 100:
+                raise RuntimeError("count_x and count_y cannot exceed 100.")
+            if count_x > 1 and abs(float(spacing_x_mm)) <= _EPSILON:
+                raise RuntimeError("spacing_x_mm cannot be zero when count_x > 1.")
+            if count_y > 1 and abs(float(spacing_y_mm)) <= _EPSILON:
+                raise RuntimeError("spacing_y_mm cannot be zero when count_y > 1.")
+        else:
+            if not isinstance(circular_count, int) or isinstance(circular_count, bool):
+                raise RuntimeError("circular_count must be an integer.")
+            if circular_count < 2 or circular_count > 360:
+                raise RuntimeError("circular_count must be between 2 and 360.")
+            if not math.isfinite(float(angle_start_deg)):
+                raise RuntimeError("angle_start_deg must be finite.")
+            if (
+                not math.isfinite(float(angle_span_deg))
+                or float(angle_span_deg) <= 0.0
+                or float(angle_span_deg) > 360.0
+            ):
+                raise RuntimeError("angle_span_deg must be in the range (0, 360].")
+
+        numeric_values = (
+            spacing_x_mm,
+            spacing_y_mm,
+            center_x_mm,
+            center_y_mm,
+        )
+        if not all(math.isfinite(float(value)) for value in numeric_values):
+            raise RuntimeError("Pattern coordinates and spacing values must be finite.")
+
+        sketch, factory2d, part, doc = _get_sketch_in_edit(catia_app, sketch_name)
+
+        source_snapshots: List[GeometrySnapshot] = []
+        for element_name in element_names:
+            source = _get_element_by_name(sketch, element_name)
+            source_snapshots.append(_snapshot_geometry(source, element_name))
+
+        transforms: List[Callable[[float, float], Tuple[float, float]]] = []
+
+        if normalised_pattern == "rectangular":
+            for y_index in range(count_y):
+                for x_index in range(count_x):
+                    if x_index == 0 and y_index == 0:
+                        continue
+                    transforms.append(
+                        _translation_transform(
+                            x_index * float(spacing_x_mm),
+                            y_index * float(spacing_y_mm),
+                        )
+                    )
+        else:
+            full_circle = math.isclose(
+                float(angle_span_deg),
+                360.0,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            )
+            denominator = circular_count if full_circle else circular_count - 1
+            angle_step = float(angle_span_deg) / denominator
+
+            for instance_index in range(1, circular_count):
+                rotation_deg = float(angle_start_deg) + instance_index * angle_step
+                transforms.append(
+                    _rotation_transform(
+                        float(center_x_mm),
+                        float(center_y_mm),
+                        math.radians(rotation_deg),
+                    )
+                )
+
+        expected_created = len(transforms) * len(source_snapshots)
+
+        try:
+            for transform in transforms:
+                for snapshot in source_snapshots:
+                    created = _create_from_snapshot(
+                        factory2d,
+                        snapshot,
+                        transform,
+                        orientation_reversed=False,
+                    )
+                    created_elements.append(created)
+                    result.element_names.append(
+                        _get_element_name(
+                            created,
+                            f"Pattern_{len(created_elements)}_{snapshot.name}",
+                        )
+                    )
+        except Exception:
+            try:
+                _delete_elements(doc, created_elements)
+                created_elements.clear()
+                result.element_names.clear()
+            except Exception as rollback_error:
+                result.warnings.append(f"Pattern rollback failed: {rollback_error}")
+            raise
+
+        result.elements_created = len(created_elements)
+        if result.elements_created != expected_created:
+            raise RuntimeError(
+                "Pattern creation count mismatch: "
+                f"expected {expected_created}, created {result.elements_created}."
+            )
+
+        # Automatically inventing distance/fix constraints changes design intent
+        # and previously used invalid enum values.  Geometry copies are created
+        # deterministically; source constraints are not cloned.
+        result.constraint_status = _evaluate_sketch(sketch)
+        result.details.update(
+            {
+                "pattern_type": normalised_pattern,
+                "source_element_count": len(source_snapshots),
+                "expected_elements_created": expected_created,
+                "counts_include_original": True,
+                "source_constraints_cloned": False,
+            }
+        )
+        if normalised_pattern == "circular":
+            result.details["circular_radius_parameter"] = (
+                "compatibility_only; actual radius is defined by source geometry "
+                "position relative to the pattern center"
+            )
+        result.status = "success"
+
+    except Exception as exc:
+        result.status = "error"
+        result.warnings.append(str(exc))
+    finally:
+        if sketch is not None and part is not None:
+            closed, updated, close_warnings = _close_sketch(sketch, part)
+            result.sketch_closed = closed
+            result.update_succeeded = updated
+            result.warnings.extend(close_warnings)
+            if result.status == "success" and result.warnings:
+                result.status = "success_with_warnings"
+        if doc is not None:
+            try:
+                doc.Selection.Clear()
+            except Exception:
+                pass
+
+    return _result_dict(result)
+
+
+SKETCH_UTILITY_MCP_TOOLS = [
+    {
+        "name": "catia_mirror_sketch_geometry",
+        "description": (
+            "Mirror Point2D, Line2D, circles, or circular arcs about a sketch "
+            "line. copy=true keeps the source and attempts to add a CATIA "
+            "symmetry constraint; copy=false creates the mirror and deletes "
+            "the source after successful creation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {
+                    "type": "string",
+                    "description": "Name of the sketch in the feature tree.",
+                },
+                "element_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names of supported geometry to mirror.",
+                },
+                "axis_name": {
+                    "type": "string",
+                    "description": "Name of the Line2D mirror axis.",
+                },
+                "copy": {
+                    "type": "boolean",
+                    "description": "Keep source geometry when true.",
+                    "default": True,
+                },
+            },
+            "required": ["sketch_name", "element_names", "axis_name"],
+        },
+    },
+    {
+        "name": "catia_trim_extend_sketch_element",
+        "description": (
+            "Trim or extend a finite Line2D to another Line2D support by moving "
+            "one source endpoint with Point2D.SetData. In trim mode, nearest "
+            "moves the endpoint closest to the intersection. In extend mode, "
+            "nearest selects the endpoint beyond which the intersection lies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {
+                    "type": "string",
+                    "description": "Name of the sketch.",
+                },
+                "element_name": {
+                    "type": "string",
+                    "description": "Name of the source Line2D.",
+                },
+                "boundary_name": {
+                    "type": "string",
+                    "description": "Name of the boundary Line2D.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["trim", "extend"],
+                    "default": "trim",
+                },
+                "extend_side": {
+                    "type": "string",
+                    "enum": ["start", "end", "nearest"],
+                    "description": "Endpoint to move; also applies to trim mode.",
+                    "default": "nearest",
+                },
+            },
+            "required": ["sketch_name", "element_name", "boundary_name"],
+        },
+    },
+    {
+        "name": "catia_pattern_sketch_elements",
+        "description": (
+            "Create rectangular or circular copies of Point2D, Line2D, circles, "
+            "or circular arcs. Counts include the original instance. Copies are "
+            "reconstructed from geometry coordinates; source constraints are "
+            "not cloned automatically."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {
+                    "type": "string",
+                    "description": "Name of the sketch.",
+                },
+                "element_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names of supported source geometry.",
+                },
+                "pattern_type": {
+                    "type": "string",
+                    "enum": ["rectangular", "circular"],
+                    "default": "rectangular",
+                },
+                "count_x": {
+                    "type": "integer",
+                    "description": "Total X instances including the original.",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "count_y": {
+                    "type": "integer",
+                    "description": "Total Y instances including the original.",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "spacing_x_mm": {
+                    "type": "number",
+                    "default": 20.0,
+                },
+                "spacing_y_mm": {
+                    "type": "number",
+                    "default": 20.0,
+                },
+                "circular_count": {
+                    "type": "integer",
+                    "description": "Total circular instances including original.",
+                    "default": 6,
+                    "minimum": 2,
+                    "maximum": 360,
+                },
+                "circular_radius_mm": {
+                    "type": "number",
+                    "description": (
+                        "Compatibility parameter. Actual radius is determined "
+                        "by source geometry position relative to the center."
+                    ),
+                    "default": 50.0,
+                },
+                "center_x_mm": {
+                    "type": "number",
+                    "default": 0.0,
+                },
+                "center_y_mm": {
+                    "type": "number",
+                    "default": 0.0,
+                },
+                "angle_start_deg": {
+                    "type": "number",
+                    "description": "Additional rotation offset in degrees.",
+                    "default": 0.0,
+                },
+                "angle_span_deg": {
+                    "type": "number",
+                    "default": 360.0,
+                    "exclusiveMinimum": 0.0,
+                    "maximum": 360.0,
+                },
+            },
+            "required": ["sketch_name", "element_names"],
+        },
+    },
+]
+
+
+def register_tools(mcp: Any, ctx: Any) -> list[str]:
+    """Register sketch utility tools using FastMCP function decorators.
+
+    FastMCP derives each tool's input schema from the wrapper function
+    signature.  This avoids the obsolete ``add_tool(parameters=..., handler=...)``
+    registration form that is incompatible with the server's installed SDK.
+    """
+
+    @mcp.tool()
+    def catia_mirror_sketch_geometry(
+        sketch_name: str,
+        element_names: List[str],
+        axis_name: str,
+        copy: bool = True,
+    ) -> Dict[str, Any]:
+        """Mirror supported sketch geometry about a line in the same sketch."""
+        try:
+            ctx.conn.ensure_connected()
+            return mirror_sketch_geometry(
+                ctx.conn.app,
+                sketch_name=sketch_name,
+                element_names=element_names,
+                axis_name=axis_name,
+                copy=copy,
+            )
+        except Exception as exc:
+            return {
+                "operation": "mirror_sketch_geometry",
+                "status": "error",
+                "elements_created": 0,
+                "elements_modified": 0,
+                "originals_deleted": 0,
+                "constraints_added": 0,
+                "constraints_removed": 0,
+                "constraint_status": "unknown",
+                "element_names": [],
+                "warnings": [str(exc)],
+                "details": {},
+                "sketch_closed": False,
+                "update_succeeded": False,
+                "document_unit": "mm",
+            }
+
+    @mcp.tool()
+    def catia_trim_extend_sketch_element(
+        sketch_name: str,
+        element_name: str,
+        boundary_name: str,
+        mode: str = "trim",
+        extend_side: str = "nearest",
+    ) -> Dict[str, Any]:
+        """Trim or extend a Line2D to another Line2D boundary."""
+        try:
+            ctx.conn.ensure_connected()
+            return trim_extend_sketch_element(
+                ctx.conn.app,
+                sketch_name=sketch_name,
+                element_name=element_name,
+                boundary_name=boundary_name,
+                mode=mode,
+                extend_side=extend_side,
+            )
+        except Exception as exc:
+            return {
+                "operation": "trim_extend_sketch_element",
+                "status": "error",
+                "elements_created": 0,
+                "elements_modified": 0,
+                "originals_deleted": 0,
+                "constraints_added": 0,
+                "constraints_removed": 0,
+                "constraint_status": "unknown",
+                "element_names": [],
+                "warnings": [str(exc)],
+                "details": {},
+                "sketch_closed": False,
+                "update_succeeded": False,
+                "document_unit": "mm",
+            }
+
+    @mcp.tool()
+    def catia_pattern_sketch_elements(
+        sketch_name: str,
+        element_names: List[str],
+        pattern_type: str = "rectangular",
+        count_x: int = 3,
+        count_y: int = 1,
+        spacing_x_mm: float = 20.0,
+        spacing_y_mm: float = 20.0,
+        circular_count: int = 6,
+        circular_radius_mm: float = 50.0,
+        center_x_mm: float = 0.0,
+        center_y_mm: float = 0.0,
+        angle_start_deg: float = 0.0,
+        angle_span_deg: float = 360.0,
+    ) -> Dict[str, Any]:
+        """Create rectangular or circular copies of supported sketch geometry."""
+        try:
+            ctx.conn.ensure_connected()
+            return pattern_sketch_elements(
+                ctx.conn.app,
+                sketch_name=sketch_name,
+                element_names=element_names,
+                pattern_type=pattern_type,
+                count_x=count_x,
+                count_y=count_y,
+                spacing_x_mm=spacing_x_mm,
+                spacing_y_mm=spacing_y_mm,
+                circular_count=circular_count,
+                circular_radius_mm=circular_radius_mm,
+                center_x_mm=center_x_mm,
+                center_y_mm=center_y_mm,
+                angle_start_deg=angle_start_deg,
+                angle_span_deg=angle_span_deg,
+            )
+        except Exception as exc:
+            return {
+                "operation": "pattern_sketch_elements",
+                "status": "error",
+                "elements_created": 0,
+                "elements_modified": 0,
+                "originals_deleted": 0,
+                "constraints_added": 0,
+                "constraints_removed": 0,
+                "constraint_status": "unknown",
+                "element_names": [],
+                "warnings": [str(exc)],
+                "details": {},
+                "sketch_closed": False,
+                "update_succeeded": False,
+                "document_unit": "mm",
+            }
+
+    return [
+        "catia_mirror_sketch_geometry",
+        "catia_trim_extend_sketch_element",
+        "catia_pattern_sketch_elements",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Registry Entry Point (Required by registry.py)
+# ---------------------------------------------------------------------------

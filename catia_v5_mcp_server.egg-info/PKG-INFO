@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: catia-v5-mcp-server
+Version: 0.1.0
+Summary: CATIA V5 MCP server through Windows COM automation
+Requires-Python: >=3.10
+Requires-Dist: mcp
+Requires-Dist: pywin32
