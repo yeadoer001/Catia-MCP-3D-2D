@@ -2209,6 +2209,885 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
     names.append("catia_add_linear_dimension")
 
     @mcp.tool()
+    def catia_create_dimension_tolerance(
+        view_name: str,
+        dimension_name: str,
+        upper_tolerance: str,
+        lower_tolerance: str,
+        tolerance_type: str = "numerical",
+        fit_code: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Modify the tolerance of an existing native CATIA DrawingDimension.
+
+        This tool modifies an existing DrawingDimension in a classic CATDrawing.
+        It does not create a new dimension.
+
+        Supported tolerance_type values:
+
+        - ``numerical``:
+          Numerical upper/lower deviations, for example:
+          upper_tolerance="+0.10"
+          lower_tolerance="-0.05"
+
+        - ``alphanumerical``:
+          Alphanumeric / fit-style tolerance, for example H7.
+
+        - ``fit``:
+          Alias for alphanumerical fit tolerance.
+
+        - ``combined``:
+          Combined fit designation and numerical deviations, for example
+          H7 together with +0.021 / 0.000.
+
+        CATIA DrawingDimension.SetTolerances COM contract:
+
+            SetTolerances(
+                iTolType,
+                iTolName,
+                iUpTol,
+                iLowTol,
+                idUpTol,
+                idLowTol,
+                DisplayMode
+            )
+
+        The tool preserves the existing CATIA tolerance display mode whenever
+        GetTolerances can be read successfully. Readback failure does not stop
+        the write operation, but is reported as a warning.
+        """
+
+        warnings: list[str] = []
+
+        requested: dict[str, Any] = {
+            "view_name": view_name,
+            "dimension_name": dimension_name,
+            "upper_tolerance": upper_tolerance,
+            "lower_tolerance": lower_tolerance,
+            "tolerance_type": tolerance_type,
+            "fit_code": fit_code,
+        }
+
+        dimension = None
+        view = None
+        document = None
+        sheet = None
+
+        def _normalise_tolerance_type(value: Any) -> str:
+            key = _nonempty_text(
+                value,
+                "tolerance_type",
+            ).lower().replace("-", "_").replace(" ", "_")
+
+            aliases = {
+                "numeric": "numerical",
+                "number": "numerical",
+
+                "alpha": "alphanumerical",
+                "alphanumeric": "alphanumerical",
+                "alpha_numerical": "alphanumerical",
+
+                "iso_fit": "fit",
+            }
+
+            key = aliases.get(key, key)
+
+            if key not in {
+                "numerical",
+                "alphanumerical",
+                "fit",
+                "combined",
+            }:
+                raise ValueError(
+                    "tolerance_type must be one of: "
+                    "'numerical', 'alphanumerical', 'fit', 'combined'."
+                )
+
+            return key
+
+        def _find_dimension(
+            drawing_view: Any,
+            requested_name: str,
+        ) -> tuple[Any, dict[str, Any]]:
+            """Find DrawingDimension by exact name, then case-insensitive scan."""
+
+            target = _nonempty_text(
+                requested_name,
+                "dimension_name",
+            )
+
+            try:
+                dimensions = drawing_view.Dimensions
+            except Exception as exc:
+                raise CapabilityUnavailableError(
+                    "The selected DrawingView does not expose "
+                    "DrawingView.Dimensions."
+                ) from exc
+
+            count = _safe_count(dimensions)
+
+            attempts: list[dict[str, Any]] = []
+
+            # Preferred CATIA collection lookup.
+            try:
+                result = dimensions.Item(target)
+
+                if result is not None:
+                    return result, {
+                        "requested_name": target,
+                        "resolved_name": str(
+                            _safe_attr(result, "Name", target)
+                        ),
+                        "dimensions_count": count,
+                        "selected_method": "DrawingDimensions.Item(name)",
+                        "attempts": [
+                            {
+                                "method": "DrawingDimensions.Item(name)",
+                                "succeeded": True,
+                                "error": None,
+                            }
+                        ],
+                    }
+
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "method": "DrawingDimensions.Item(name)",
+                        "succeeded": False,
+                        "error": str(exc),
+                    }
+                )
+
+            # Defensive fallback because CATIA dimension naming / COM wrapper
+            # behavior can differ between installations.
+            available_names: list[str] = []
+
+            for index in range(1, (count or 0) + 1):
+                try:
+                    candidate = dimensions.Item(index)
+                    candidate_name = str(
+                        _safe_attr(candidate, "Name", "")
+                    ).strip()
+
+                    if candidate_name:
+                        available_names.append(candidate_name)
+
+                    if (
+                        candidate_name
+                        and candidate_name.casefold() == target.casefold()
+                    ):
+                        attempts.append(
+                            {
+                                "method": (
+                                    "DrawingDimensions.Item(index)"
+                                    "_case_insensitive_name_match"
+                                ),
+                                "succeeded": True,
+                                "index": index,
+                                "error": None,
+                            }
+                        )
+
+                        return candidate, {
+                            "requested_name": target,
+                            "resolved_name": candidate_name,
+                            "dimensions_count": count,
+                            "selected_method": (
+                                "DrawingDimensions.Item(index)"
+                                "_case_insensitive_name_match"
+                            ),
+                            "resolved_index": index,
+                            "attempts": attempts,
+                        }
+
+                except Exception as exc:
+                    attempts.append(
+                        {
+                            "method": "DrawingDimensions.Item(index)",
+                            "index": index,
+                            "succeeded": False,
+                            "error": str(exc),
+                        }
+                    )
+
+            raise LookupError(
+                f"Drawing dimension '{target}' was not found in "
+                f"view '{_safe_attr(drawing_view, 'Name', view_name)}'. "
+                f"Available dimensions: "
+                f"{available_names if available_names else 'unknown'}."
+            )
+
+        def _read_tolerances(
+            drawing_dimension: Any,
+        ) -> dict[str, Any]:
+            """Best-effort DrawingDimension.GetTolerances readback.
+
+            CATIA/pywin32 wrappers differ in how COM out parameters are
+            marshalled. Therefore failure here is diagnostic rather than fatal.
+            """
+
+            result: dict[str, Any] = {
+                "available": False,
+                "read_method": None,
+                "tolerance_type": None,
+                "tolerance_name": None,
+                "upper_alphanumerical": None,
+                "lower_alphanumerical": None,
+                "upper_numerical": None,
+                "lower_numerical": None,
+                "display_mode": None,
+                "raw_result": None,
+                "error": None,
+            }
+
+            getter = _safe_attr(
+                drawing_dimension,
+                "GetTolerances",
+                None,
+            )
+
+            if not callable(getter):
+                result["error"] = (
+                    "DrawingDimension.GetTolerances is unavailable."
+                )
+                return result
+
+            # First try the normal generated/native pywin32 proxy.
+            try:
+                raw = getter()
+
+                if isinstance(raw, (tuple, list)):
+                    result["raw_result"] = list(raw)
+
+                    if len(raw) >= 7:
+                        result.update(
+                            {
+                                "available": True,
+                                "read_method": (
+                                    "DrawingDimension.GetTolerances()"
+                                ),
+                                "tolerance_type": int(raw[0]),
+                                "tolerance_name": (
+                                    None
+                                    if raw[1] is None
+                                    else str(raw[1])
+                                ),
+                                "upper_alphanumerical": (
+                                    None
+                                    if raw[2] is None
+                                    else str(raw[2])
+                                ),
+                                "lower_alphanumerical": (
+                                    None
+                                    if raw[3] is None
+                                    else str(raw[3])
+                                ),
+                                "upper_numerical": float(raw[4]),
+                                "lower_numerical": float(raw[5]),
+                                "display_mode": int(raw[6]),
+                                "error": None,
+                            }
+                        )
+
+                        return result
+
+                result["error"] = (
+                    "GetTolerances returned an unexpected result: "
+                    f"{raw!r}"
+                )
+
+            except Exception as exc:
+                result["error"] = str(exc)
+
+            return result
+
+        try:
+            # -------------------------------------------------------------
+            # A. Validate arguments
+            # -------------------------------------------------------------
+
+            requested_view_name = _nonempty_text(
+                view_name,
+                "view_name",
+            )
+
+            requested_dimension_name = _nonempty_text(
+                dimension_name,
+                "dimension_name",
+            )
+
+            resolved_tolerance_type = _normalise_tolerance_type(
+                tolerance_type
+            )
+
+            upper_text = (
+                ""
+                if upper_tolerance is None
+                else str(upper_tolerance).strip()
+            )
+
+            lower_text = (
+                ""
+                if lower_tolerance is None
+                else str(lower_tolerance).strip()
+            )
+
+            fit_text: Optional[str] = None
+
+            if fit_code is not None:
+                candidate = str(fit_code).strip()
+
+                if candidate:
+                    fit_text = candidate
+
+            # -------------------------------------------------------------
+            # B. Resolve CATDrawing / sheet / view
+            # -------------------------------------------------------------
+
+            document = _active_drawing_document(ctx)
+            sheet = _active_sheet(document)
+            view = _drawing_view(
+                sheet,
+                requested_view_name,
+            )
+
+            try:
+                view.Activate()
+            except Exception as exc:
+                warnings.append(
+                    "DrawingView.Activate failed before tolerance update: "
+                    f"{exc}"
+                )
+
+            # -------------------------------------------------------------
+            # C. Resolve existing DrawingDimension
+            # -------------------------------------------------------------
+
+            dimension, dimension_lookup = _find_dimension(
+                view,
+                requested_dimension_name,
+            )
+
+            resolved_dimension_name = str(
+                _safe_attr(
+                    dimension,
+                    "Name",
+                    requested_dimension_name,
+                )
+            )
+
+            # -------------------------------------------------------------
+            # D. Verify CATIA tolerance capability
+            # -------------------------------------------------------------
+
+            set_tolerances = _safe_attr(
+                dimension,
+                "SetTolerances",
+                None,
+            )
+
+            if not callable(set_tolerances):
+                raise CapabilityUnavailableError(
+                    "The selected DrawingDimension does not expose "
+                    "DrawingDimension.SetTolerances."
+                )
+
+            # -------------------------------------------------------------
+            # E. Read current tolerance before modification
+            # -------------------------------------------------------------
+
+            tolerance_before = _read_tolerances(
+                dimension
+            )
+
+            if not tolerance_before["available"]:
+                warnings.append(
+                    "Existing DrawingDimension tolerance could not be "
+                    "read before modification. CATIA DisplayMode=0 will "
+                    "be used unless another readable value is available. "
+                    f"Reason: {tolerance_before['error']}"
+                )
+
+            existing_type = tolerance_before.get(
+                "tolerance_type"
+            )
+
+            existing_name = tolerance_before.get(
+                "tolerance_name"
+            )
+
+            existing_display_mode = tolerance_before.get(
+                "display_mode"
+            )
+
+            if existing_display_mode is None:
+                display_mode = 0
+            else:
+                display_mode = int(
+                    existing_display_mode
+                )
+
+            # -------------------------------------------------------------
+            # F. Build SetTolerances arguments
+            # -------------------------------------------------------------
+
+            i_tol_type: int
+            i_tol_name: str
+
+            i_up_tol: str
+            i_low_tol: str
+
+            id_up_tol: float
+            id_low_tol: float
+
+            if resolved_tolerance_type == "numerical":
+                if not upper_text:
+                    raise ValueError(
+                        "upper_tolerance cannot be empty when "
+                        "tolerance_type='numerical'."
+                    )
+
+                if not lower_text:
+                    raise ValueError(
+                        "lower_tolerance cannot be empty when "
+                        "tolerance_type='numerical'."
+                    )
+
+                id_up_tol = _finite_float(
+                    upper_text,
+                    "upper_tolerance",
+                )
+
+                id_low_tol = _finite_float(
+                    lower_text,
+                    "lower_tolerance",
+                )
+
+                # CATIA numerical tolerance format:
+                #
+                #   1 numerical side-by-side
+                #   2 numerical superimposed
+                #   3 resolved numerical side-by-side
+                #   4 resolved numerical superimposed
+                #
+                # Preserve an existing numerical presentation when possible.
+                if existing_type in (1, 2, 3, 4):
+                    i_tol_type = int(existing_type)
+                    i_tol_name = (
+                        str(existing_name)
+                        if existing_name
+                        else "TOL_NUM2"
+                    )
+                else:
+                    # Default to the standard CATIA numerical
+                    # superimposed presentation.
+                    i_tol_type = 2
+                    i_tol_name = "TOL_NUM2"
+
+                # Alpha fields are unused for pure numerical tolerance.
+                i_up_tol = ""
+                i_low_tol = ""
+
+            elif resolved_tolerance_type in {
+                "alphanumerical",
+                "fit",
+            }:
+                # fit_code has priority for an ISO fit such as H7.
+                alpha_upper = (
+                    fit_text
+                    if fit_text is not None
+                    else upper_text
+                )
+
+                alpha_lower = lower_text
+
+                if not alpha_upper:
+                    raise ValueError(
+                        "fit_code or upper_tolerance is required for "
+                        "alphanumerical/fit tolerance."
+                    )
+
+                # CATIA alpha tolerance formats:
+                #
+                #   5 alphanumerical single
+                #   6 alphanumerical side-by-side
+                #   7 alphanumerical superimposed
+                if alpha_lower:
+                    if existing_type in (6, 7):
+                        i_tol_type = int(existing_type)
+                        i_tol_name = (
+                            str(existing_name)
+                            if existing_name
+                            else "TOL_ALP2"
+                        )
+                    else:
+                        i_tol_type = 6
+                        i_tol_name = "TOL_ALP2"
+                else:
+                    if existing_type == 5:
+                        i_tol_type = 5
+                        i_tol_name = (
+                            str(existing_name)
+                            if existing_name
+                            else "ISOALPH1"
+                        )
+                    else:
+                        i_tol_type = 5
+                        i_tol_name = "ISOALPH1"
+
+                i_up_tol = alpha_upper
+                i_low_tol = alpha_lower
+
+                # Numerical fields do not drive a pure alpha/fit tolerance.
+                id_up_tol = 0.0
+                id_low_tol = 0.0
+
+            else:
+                # combined
+                if not fit_text:
+                    raise ValueError(
+                        "fit_code is required when "
+                        "tolerance_type='combined'."
+                    )
+
+                if not upper_text:
+                    raise ValueError(
+                        "upper_tolerance is required when "
+                        "tolerance_type='combined'."
+                    )
+
+                if not lower_text:
+                    raise ValueError(
+                        "lower_tolerance is required when "
+                        "tolerance_type='combined'."
+                    )
+
+                id_up_tol = _finite_float(
+                    upper_text,
+                    "upper_tolerance",
+                )
+
+                id_low_tol = _finite_float(
+                    lower_text,
+                    "lower_tolerance",
+                )
+
+                # CATIA predefined combined ISO alpha/numerical format.
+                i_tol_type = 0
+                i_tol_name = "ISOCOMB"
+
+                i_up_tol = fit_text
+                i_low_tol = ""
+
+            set_arguments = {
+                "iTolType": i_tol_type,
+                "iTolName": i_tol_name,
+                "iUpTol": i_up_tol,
+                "iLowTol": i_low_tol,
+                "idUpTol": id_up_tol,
+                "idLowTol": id_low_tol,
+                "DisplayMode": display_mode,
+            }
+
+            # -------------------------------------------------------------
+            # G. Execute CATIA DrawingDimension.SetTolerances
+            # -------------------------------------------------------------
+
+            try:
+                dimension.SetTolerances(
+                    i_tol_type,
+                    i_tol_name,
+                    i_up_tol,
+                    i_low_tol,
+                    id_up_tol,
+                    id_low_tol,
+                    display_mode,
+                )
+
+            except Exception as exc:
+                raise AnnotationOperationError(
+                    "DrawingDimension.SetTolerances failed. "
+                    "The requested tolerance format may be unsupported "
+                    "by the current CATIA drafting standard or the "
+                    "selected dimension.",
+                    data={
+                        "failure_stage": (
+                            "G_DrawingDimension_SetTolerances"
+                        ),
+                        "view_name": str(
+                            _safe_attr(
+                                view,
+                                "Name",
+                                requested_view_name,
+                            )
+                        ),
+                        "dimension_name": (
+                            resolved_dimension_name
+                        ),
+                        "set_tolerances_arguments": (
+                            set_arguments
+                        ),
+                        "com_error": str(exc),
+                    },
+                ) from exc
+
+            # -------------------------------------------------------------
+            # H. Save view edition and update drawing
+            # -------------------------------------------------------------
+
+            _save_view_edition(
+                view,
+                warnings,
+            )
+
+            _update_drawing(
+                sheet,
+                document,
+                warnings,
+            )
+
+            # -------------------------------------------------------------
+            # I. Best-effort post-write readback
+            # -------------------------------------------------------------
+
+            tolerance_after = _read_tolerances(
+                dimension
+            )
+
+            tolerance_readback_verified: Optional[bool] = None
+
+            if tolerance_after["available"]:
+                actual_type = tolerance_after.get(
+                    "tolerance_type"
+                )
+
+                type_matches = (
+                    actual_type == i_tol_type
+                )
+
+                if resolved_tolerance_type == "numerical":
+                    actual_up = tolerance_after.get(
+                        "upper_numerical"
+                    )
+                    actual_low = tolerance_after.get(
+                        "lower_numerical"
+                    )
+
+                    numerical_matches = bool(
+                        actual_up is not None
+                        and actual_low is not None
+                        and abs(
+                            float(actual_up) - id_up_tol
+                        ) <= 1e-12
+                        and abs(
+                            float(actual_low) - id_low_tol
+                        ) <= 1e-12
+                    )
+
+                    tolerance_readback_verified = bool(
+                        type_matches
+                        and numerical_matches
+                    )
+
+                elif resolved_tolerance_type in {
+                    "alphanumerical",
+                    "fit",
+                }:
+                    actual_up_alpha = str(
+                        tolerance_after.get(
+                            "upper_alphanumerical"
+                        )
+                        or ""
+                    )
+
+                    actual_low_alpha = str(
+                        tolerance_after.get(
+                            "lower_alphanumerical"
+                        )
+                        or ""
+                    )
+
+                    tolerance_readback_verified = bool(
+                        type_matches
+                        and actual_up_alpha == i_up_tol
+                        and actual_low_alpha == i_low_tol
+                    )
+
+                else:
+                    # Combined tolerance readback can vary according to
+                    # CATIA drafting-standard resolution. Require at least
+                    # the expected tolerance type for positive verification.
+                    tolerance_readback_verified = bool(
+                        type_matches
+                    )
+
+                if tolerance_readback_verified is False:
+                    warnings.append(
+                        "DrawingDimension.GetTolerances succeeded after "
+                        "the write, but the returned tolerance does not "
+                        "fully match the requested values."
+                    )
+
+            else:
+                warnings.append(
+                    "Tolerance modification completed, but "
+                    "DrawingDimension.GetTolerances could not verify the "
+                    "post-write values. "
+                    f"Reason: {tolerance_after['error']}"
+                )
+
+            # -------------------------------------------------------------
+            # J. Success response
+            # -------------------------------------------------------------
+
+            return _success(
+                {
+                    "annotation_type": "DrawingDimension",
+                    "operation": (
+                        "modify_existing_dimension_tolerance"
+                    ),
+
+                    "document_name": str(
+                        _safe_attr(
+                            document,
+                            "Name",
+                            "",
+                        )
+                    ),
+
+                    "sheet_name": str(
+                        _safe_attr(
+                            sheet,
+                            "Name",
+                            "",
+                        )
+                    ),
+
+                    "view_name": str(
+                        _safe_attr(
+                            view,
+                            "Name",
+                            requested_view_name,
+                        )
+                    ),
+
+                    "dimension_name": (
+                        resolved_dimension_name
+                    ),
+
+                    "dimension_lookup": (
+                        dimension_lookup
+                    ),
+
+                    "dimension_type_code": _safe_attr(
+                        dimension,
+                        "DimType",
+                        None,
+                    ),
+
+                    "tolerance_type_requested": (
+                        tolerance_type
+                    ),
+
+                    "tolerance_type_resolved": (
+                        resolved_tolerance_type
+                    ),
+
+                    "fit_code": fit_text,
+
+                    "upper_tolerance_requested": (
+                        upper_text
+                    ),
+
+                    "lower_tolerance_requested": (
+                        lower_text
+                    ),
+
+                    "set_tolerances_arguments": (
+                        set_arguments
+                    ),
+
+                    "tolerance_before": (
+                        tolerance_before
+                    ),
+
+                    "tolerance_after": (
+                        tolerance_after
+                    ),
+
+                    "tolerance_readback_verified": (
+                        tolerance_readback_verified
+                    ),
+
+                    "native_drawing_dimension_modified": True,
+                    "dimension_created": False,
+                    "model_modified": True,
+                    "document_save_required": True,
+                },
+                warnings,
+            )
+
+        except Exception as exc:
+            inherited_data = (
+                exc.data
+                if isinstance(
+                    exc,
+                    AnnotationOperationError,
+                )
+                else None
+            )
+
+            return _error(
+                "catia_create_dimension_tolerance",
+                exc,
+                data={
+                    "requested": requested,
+                    "failure_evidence": inherited_data,
+                    "dimension_name": (
+                        str(
+                            _safe_attr(
+                                dimension,
+                                "Name",
+                                dimension_name,
+                            )
+                        )
+                        if dimension is not None
+                        else dimension_name
+                    ),
+                    "view_name": (
+                        str(
+                            _safe_attr(
+                                view,
+                                "Name",
+                                view_name,
+                            )
+                        )
+                        if view is not None
+                        else view_name
+                    ),
+                    # This operation only changes an existing dimension.
+                    # There is no newly created object to delete on failure.
+                    "rollback_available": False,
+                    "model_modified": (
+                        dimension is not None
+                    ),
+                    "document_save_required": (
+                        dimension is not None
+                    ),
+                },
+                warnings=warnings,
+                status=(
+                    "capability_unavailable"
+                    if isinstance(
+                        exc,
+                        CapabilityUnavailableError,
+                    )
+                    else "error"
+                ),
+            )
+
+    names.append("catia_create_dimension_tolerance")
+
+    @mcp.tool()
     def catia_create_section_view(
         parent_view_name: str,
         cut_line_points: list[Tuple[float, float]],
@@ -2565,40 +3444,505 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
 
     @mcp.tool()
     def catia_create_gdt_frame(
-        view_name: str,
-        symbol_type: str,
-        tolerance_value: str,
-        datum_refs: Optional[list[str]] = None,
-        position_xy: Tuple[float, float] = (50.0, 50.0),
-        leader_xy: Optional[Tuple[float, float]] = None,
+            view_name: str,
+            symbol_type: str,
+            tolerance_value: str,
+            datum_refs: Optional[list[str]] = None,
+            position_xy: Tuple[float, float] = (50.0, 50.0),
+            leader_xy: Optional[Tuple[float, float]] = None,
+            attach_element: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Create and verify a native two-dimensional DrawingGDT frame.
 
-        This tool creates a classic drafting annotation. It does not create a
-        semantic three-dimensional FT&A tolerance.
-        """
         gdt = None
         gdts = None
         created_index: Optional[int] = None
         before_count: Optional[int] = None
         warnings: list[str] = []
 
+        # 实际找到的几何对象。成功找到后可用于 DrawingLeader.HeadTarget。
+        attached_element_obj: Any = None
+        attached_element_name: Optional[str] = None
+
+        # 标记 HeadTarget 是否真正设置成功。
+        head_target_attached = False
+
+        def _object_name(obj: Any) -> Optional[str]:
+            """安全读取 CATIA COM 对象名称。"""
+            if obj is None:
+                return None
+            try:
+                value = getattr(obj, "Name")
+                if value is None:
+                    return None
+                text = str(value).strip()
+                return text or None
+            except Exception:
+                return None
+
+        def _as_xy(value: Any) -> Optional[Tuple[float, float]]:
+            """将 CATIA 返回的二维/多维坐标安全转换为 (x, y)。"""
+            if value is None:
+                return None
+
+            if isinstance(value, (tuple, list)) and len(value) >= 2:
+                try:
+                    return (float(value[0]), float(value[1]))
+                except (TypeError, ValueError):
+                    return None
+
+            return None
+
+        def _extract_element_anchor(
+                element: Any,
+        ) -> Optional[Tuple[float, float]]:
+            """尝试从不同类型的二维几何元素中取得合理的 Leader 锚点。
+
+            CATIA Drafting 的 GeometricElements 可以包含 Point2D、Line2D、
+            Circle2D、Curve2D 等多种 COM 类型，其坐标接口并不完全一致。
+            因此这里采用保守的多级探测策略：
+            1. x/y 或 X/Y 属性；
+            2. GetCoordinates()；
+            3. StartPoint / EndPoint；
+            4. Center / CenterPoint；
+            5. GetPoint()/GetPoints() 形式的路径接口。
+
+            无法可靠取得坐标时返回 None，并要求调用方显式提供 leader_xy。
+            """
+            if element is None:
+                return None
+
+            # 1. 常见 Point2D / 几何对象直接坐标属性。
+            for x_name, y_name in (
+                    ("x", "y"),
+                    ("X", "Y"),
+                    ("XCoord", "YCoord"),
+            ):
+                try:
+                    x_value = getattr(element, x_name)
+                    y_value = getattr(element, y_name)
+                    return (float(x_value), float(y_value))
+                except Exception:
+                    pass
+
+            # 2. 某些几何对象通过 GetCoordinates 返回 CATSafeArray。
+            try:
+                get_coordinates = getattr(element, "GetCoordinates")
+            except Exception:
+                get_coordinates = None
+
+            if callable(get_coordinates):
+                try:
+                    coords = get_coordinates()
+                    point = _as_xy(coords)
+                    if point is not None:
+                        return point
+                except Exception:
+                    pass
+
+            # 3. 对线段/曲线优先使用端点，端点更适合作为 Leader 箭头落点。
+            for point_attr in ("StartPoint", "EndPoint"):
+                try:
+                    point_obj = getattr(element, point_attr)
+                except Exception:
+                    point_obj = None
+
+                if point_obj is not None:
+                    point = _extract_element_anchor(point_obj)
+                    if point is not None:
+                        return point
+
+            # 4. 对圆或圆弧等对象，可退化使用中心点。
+            for center_attr in ("Center", "CenterPoint"):
+                try:
+                    center_obj = getattr(element, center_attr)
+                except Exception:
+                    center_obj = None
+
+                if center_obj is not None:
+                    point = _extract_element_anchor(center_obj)
+                    if point is not None:
+                        return point
+
+            # 5. 对暴露 GetPoints/GetPoint 的对象尝试取得第一个二维点。
+            try:
+                get_points = getattr(element, "GetPoints")
+            except Exception:
+                get_points = None
+
+            if callable(get_points):
+                try:
+                    points = get_points()
+
+                    # 某些 COM wrapper 直接返回坐标数组。
+                    point = _as_xy(points)
+                    if point is not None:
+                        return point
+
+                    # 某些 wrapper 可能返回 (count, array)。
+                    if isinstance(points, (tuple, list)):
+                        for candidate in points:
+                            point = _as_xy(candidate)
+                            if point is not None:
+                                return point
+                except Exception:
+                    pass
+
+            try:
+                nb_point = int(getattr(element, "NbPoint"))
+            except Exception:
+                nb_point = 0
+
+            if nb_point > 0:
+                try:
+                    get_point = getattr(element, "GetPoint")
+                except Exception:
+                    get_point = None
+
+                if callable(get_point):
+                    try:
+                        result = get_point(1)
+                        point = _as_xy(result)
+                        if point is not None:
+                            return point
+                    except Exception:
+                        pass
+
+            return None
+
+        def _find_view_element(
+                view: Any,
+                requested_name: str,
+        ) -> tuple[Any, Optional[str]]:
+            """按名称定位 DrawingView 内的二维几何元素。
+
+            优先使用标准的 view.GeometricElements 集合。
+            如果具体 CATIA 环境额外暴露 view.Search，则再进行 best-effort 尝试。
+            """
+            target_name = _nonempty_text(requested_name, "attach_element")
+            target_lower = target_name.casefold()
+
+            geometric_elements = None
+            try:
+                geometric_elements = view.GeometricElements
+            except Exception as exc:
+                warnings.append(
+                    "attach_element lookup: DrawingView.GeometricElements is unavailable: "
+                    f"{exc}"
+                )
+
+            if geometric_elements is not None:
+                # 某些 CATIA collection 的 Item() 可以直接接受名称。
+                try:
+                    candidate = geometric_elements.Item(target_name)
+                    if candidate is not None:
+                        candidate_name = _object_name(candidate) or target_name
+                        return candidate, candidate_name
+                except Exception:
+                    pass
+
+                # 名称直接索引失败时，遍历集合进行大小写不敏感匹配。
+                count = _safe_count(geometric_elements) or 0
+                for index in range(1, count + 1):
+                    try:
+                        candidate = geometric_elements.Item(index)
+                    except Exception:
+                        continue
+
+                    candidate_name = _object_name(candidate)
+                    if (
+                            candidate_name is not None
+                            and candidate_name.casefold() == target_lower
+                    ):
+                        return candidate, candidate_name
+
+            # 某些封装或定制环境可能在 view 上额外暴露 Search。
+            # 标准 V5 DrawingView Automation 并不应假设该接口一定存在，因此只做
+            # best-effort 探测，不把它作为唯一定位方式。
+            try:
+                search_method = getattr(view, "Search")
+            except Exception:
+                search_method = None
+
+            if callable(search_method):
+                try:
+                    search_result = search_method(target_name)
+
+                    # Search 可能直接返回对象。
+                    if search_result is not None:
+                        result_name = _object_name(search_result)
+                        if (
+                                result_name is not None
+                                and result_name.casefold() == target_lower
+                        ):
+                            return search_result, result_name
+
+                        # 也可能返回 collection 风格结果。
+                        result_count = _safe_count(search_result)
+                        if result_count:
+                            for index in range(1, result_count + 1):
+                                try:
+                                    candidate = search_result.Item(index)
+                                except Exception:
+                                    continue
+
+                                candidate_name = _object_name(candidate)
+                                if (
+                                        candidate_name is not None
+                                        and candidate_name.casefold() == target_lower
+                                ):
+                                    return candidate, candidate_name
+                except Exception as exc:
+                    warnings.append(
+                        f"attach_element lookup through view.Search failed: {exc}"
+                    )
+
+            return None, None
+
+        def _read_leader_points(
+                leader: Any,
+                fallback_start: Tuple[float, float],
+                fallback_end: Tuple[float, float],
+        ) -> list[list[float]]:
+            """读取 Leader 路径点。
+
+            优先从 DrawingLeader.GetPoints / GetPoint 读取 CATIA 实际路径；
+            若 COM wrapper 无法返回 out 参数，则至少返回调用 Add 时使用的
+            Leader 起点和 GDT 框位置，以保证返回结构稳定。
+            """
+            actual_points: list[Tuple[float, float]] = []
+
+            if leader is not None:
+                # pywin32/comtypes 对 CATSafeArray out 参数的包装方式可能不同，
+                # 因此同时兼容 GetPoints() 直接返回坐标数组的情况。
+                try:
+                    get_points = getattr(leader, "GetPoints")
+                except Exception:
+                    get_points = None
+
+                if callable(get_points):
+                    try:
+                        result = get_points()
+
+                        flattened: Optional[list[float]] = None
+
+                        if isinstance(result, (tuple, list)):
+                            # 形式一：(x1, y1, x2, y2, ...)
+                            if (
+                                    len(result) >= 4
+                                    and all(
+                                isinstance(item, (int, float))
+                                for item in result
+                            )
+                            ):
+                                flattened = [float(item) for item in result]
+
+                            # 形式二：(count, (x1, y1, ...))
+                            if flattened is None:
+                                for item in result:
+                                    if (
+                                            isinstance(item, (tuple, list))
+                                            and len(item) >= 2
+                                            and all(
+                                        isinstance(value, (int, float))
+                                        for value in item
+                                    )
+                                    ):
+                                        flattened = [float(value) for value in item]
+                                        break
+
+                        if flattened is not None:
+                            for index in range(0, len(flattened) - 1, 2):
+                                actual_points.append(
+                                    (flattened[index], flattened[index + 1])
+                                )
+                    except Exception:
+                        pass
+
+                # 如果 GetPoints 没有通过 wrapper 返回数据，则逐点读取。
+                if not actual_points:
+                    try:
+                        nb_point = int(getattr(leader, "NbPoint"))
+                    except Exception:
+                        nb_point = 0
+
+                    if nb_point > 0:
+                        try:
+                            get_point = getattr(leader, "GetPoint")
+                        except Exception:
+                            get_point = None
+
+                        if callable(get_point):
+                            for index in range(1, nb_point + 1):
+                                try:
+                                    result = get_point(index)
+                                except Exception:
+                                    continue
+
+                                point = _as_xy(result)
+                                if point is not None:
+                                    actual_points.append(point)
+
+            if len(actual_points) < 2:
+                actual_points = [fallback_start, fallback_end]
+
+            # CATIA 返回点序是否从箭头端开始，可能依 COM wrapper / 对象状态而异。
+            # 根据已知 leader 起点自动校正方向，保证返回值语义统一：
+            # points[0] 始终是被测特征侧，points[-1] 始终是 GDT 框侧。
+            if len(actual_points) >= 2:
+                first = actual_points[0]
+                last = actual_points[-1]
+
+                first_distance = (
+                        (first[0] - fallback_start[0]) ** 2
+                        + (first[1] - fallback_start[1]) ** 2
+                )
+                last_distance = (
+                        (last[0] - fallback_start[0]) ** 2
+                        + (last[1] - fallback_start[1]) ** 2
+                )
+
+                if last_distance < first_distance:
+                    actual_points.reverse()
+
+            return [[float(x), float(y)] for x, y in actual_points]
+
+        def _try_set_leader_head_symbol(leader: Any) -> Optional[Any]:
+            """尽可能设置 Leader 箭头样式。
+
+            CATIA Automation 对应属性名是 HeadSymbol，而不是 Head。
+            不同 Python COM 环境对 CatSymbolType 枚举常量的导出方式不同，
+            因此这里仅在运行环境已提供明确的枚举常量时设置，避免硬编码
+            未经验证的整数枚举值导致错误箭头类型。
+            """
+            if leader is None:
+                return None
+
+            # 常见 wrapper 可能把 CATIA 枚举常量导入当前模块 globals()。
+            # 仅使用确实存在的常量；绝不猜测整数值。
+            candidate_names = (
+                "catFilledArrow",
+                "catFilledTriangle",
+                "catSolidArrow",
+                "catDot",
+            )
+
+            for constant_name in candidate_names:
+                if constant_name not in globals():
+                    continue
+
+                try:
+                    constant_value = globals()[constant_name]
+                    setattr(leader, "HeadSymbol", constant_value)
+                    return constant_value
+                except Exception:
+                    continue
+
+            return None
+
         try:
             canonical_symbol, symbol_code = _gdt_symbol(symbol_type)
+
             tolerance = _nonempty_text(tolerance_value, "tolerance_value")
             if "|" in tolerance:
                 raise ValueError("tolerance_value cannot contain '|'.")
+
             datums = _datum_references(datum_refs)
             frame_position = _point2(position_xy, "position_xy")
-            leader_position = (
-                _point2(leader_xy, "leader_xy")
-                if leader_xy is not None
-                else frame_position
-            )
 
             document = _active_drawing_document(ctx)
             sheet = _active_sheet(document)
             view = _drawing_view(sheet, view_name)
+
+            # ---------------------------------------------------------------
+            # 第一步：在创建 GDT 前先确定 Leader 的几何附着位置。
+            # ---------------------------------------------------------------
+            requested_attach_name: Optional[str] = None
+            if attach_element is not None:
+                requested_attach_name = _nonempty_text(
+                    attach_element,
+                    "attach_element",
+                )
+
+                attached_element_obj, attached_element_name = _find_view_element(
+                    view,
+                    requested_attach_name,
+                )
+
+                if attached_element_obj is None:
+                    if leader_xy is None:
+                        raise AnnotationOperationError(
+                            "attach_element could not be resolved and leader_xy was not "
+                            "provided. Query the DrawingView geometry first and pass a "
+                            "valid leader attachment coordinate.",
+                            data={
+                                "attach_element": requested_attach_name,
+                                "view_name": view_name,
+                            },
+                        )
+
+                    warnings.append(
+                        f"attach_element '{requested_attach_name}' could not be resolved; "
+                        "the explicitly supplied leader_xy will be used, but HeadTarget "
+                        "cannot be established."
+                    )
+
+            if leader_xy is not None:
+                # Agent 显式提供的几何投影点优先级最高。
+                leader_position = _point2(leader_xy, "leader_xy")
+                leader_position_source = "explicit_leader_xy"
+            elif attached_element_obj is not None:
+                # 未提供 leader_xy 时，才尝试从 attach_element 自动推导坐标。
+                inferred_anchor = _extract_element_anchor(attached_element_obj)
+
+                if inferred_anchor is None:
+                    raise AnnotationOperationError(
+                        "attach_element was found, but no reliable 2D anchor coordinate "
+                        "could be derived from it. Query the geometry first and pass "
+                        "leader_xy explicitly.",
+                        data={
+                            "attach_element": attached_element_name
+                                              or requested_attach_name,
+                            "view_name": view_name,
+                        },
+                    )
+
+                leader_position = _point2(
+                    inferred_anchor,
+                    "leader_xy",
+                )
+                leader_position_source = "attach_element_inferred"
+
+                warnings.append(
+                    "leader_xy was not supplied explicitly; it was inferred from "
+                    f"attach_element '{attached_element_name or requested_attach_name}'. "
+                    "For deterministic AI-agent behavior, explicitly passing the "
+                    "2D projected geometry coordinate is recommended."
+                )
+            else:
+                # 与旧逻辑不同：绝不再把 frame_position 当作 leader_position。
+                raise AnnotationOperationError(
+                    "leader_xy is required unless attach_element can be resolved to a "
+                    "valid 2D anchor point. The Agent must query the target view geometry "
+                    "before creating a GDT.",
+                    data={
+                        "view_name": view_name,
+                        "position_xy": list(frame_position),
+                    },
+                )
+
+            # 防止零长度 Leader。即使 CATIA 接受相同坐标，也不满足工具契约。
+            dx = leader_position[0] - frame_position[0]
+            dy = leader_position[1] - frame_position[1]
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                raise AnnotationOperationError(
+                    "leader_xy must be different from position_xy. A GDT annotation "
+                    "must have a visible, non-zero-length leader.",
+                    data={
+                        "leader_xy": list(leader_position),
+                        "position_xy": list(frame_position),
+                    },
+                )
+
             try:
                 gdts = view.GDTs
                 before_count = int(gdts.Count)
@@ -2609,6 +3953,18 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 ) from exc
 
             encoded_text = "|".join([tolerance, *datums])
+
+            # ---------------------------------------------------------------
+            # 第二步：使用明确不同的 Leader 坐标与 GDT 框坐标创建 DrawingGDT。
+            #
+            # DrawingGDTs.Add(
+            #     leader_x, leader_y,
+            #     frame_x, frame_y,
+            #     symbol, text
+            # )
+            #
+            # 不再存在旧代码中 leader_xy=None 时 leader=frame 的退化路径。
+            # ---------------------------------------------------------------
             try:
                 gdt = gdts.Add(
                     leader_position[0],
@@ -2625,6 +3981,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 ) from exc
 
             created_index = int(gdts.Count)
+
             if created_index != before_count + 1:
                 raise AnnotationOperationError(
                     "DrawingGDTs.Add returned without increasing the collection count.",
@@ -2634,14 +3991,18 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     },
                 )
 
+            # 保留现有 tolerance 类型设置和读取验证。
             try:
                 gdt.SetToleranceType(1, symbol_code)
             except Exception as exc:
-                warnings.append(f"DrawingGDT.SetToleranceType verification failed: {exc}")
+                warnings.append(
+                    f"DrawingGDT.SetToleranceType verification failed: {exc}"
+                )
 
             actual_symbol_code: Optional[int]
             try:
                 actual_symbol_code = int(gdt.GetToleranceType(1))
+
                 if actual_symbol_code != symbol_code:
                     raise AnnotationOperationError(
                         "DrawingGDT symbol readback mismatch.",
@@ -2654,36 +4015,142 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 raise
             except Exception as exc:
                 actual_symbol_code = None
-                warnings.append(f"DrawingGDT symbol could not be read back: {exc}")
+                warnings.append(
+                    f"DrawingGDT symbol could not be read back: {exc}"
+                )
 
+            # ---------------------------------------------------------------
+            # Leader 是本工具的强制组成部分：
+            # 不再执行任何 Leaders.Remove 清理操作。
+            # ---------------------------------------------------------------
             leaders = _safe_attr(gdt, "Leaders")
-            leader_count_before_cleanup = _safe_count(leaders)
-            leader_cleanup_attempts: list[dict[str, Any]] = []
-            if leader_xy is None and leaders is not None:
-                count = _safe_count(leaders) or 0
-                for index in range(count, 0, -1):
-                    try:
-                        leaders.Remove(index)
-                        leader_cleanup_attempts.append(
-                            {"index": index, "succeeded": True, "error": None}
-                        )
-                    except Exception as exc:
-                        leader_cleanup_attempts.append(
-                            {"index": index, "succeeded": False, "error": str(exc)}
-                        )
-                if (_safe_count(leaders) or 0) > 0:
+            leader_count = _safe_count(leaders)
+
+            if leaders is None or leader_count is None or leader_count < 1:
+                raise AnnotationOperationError(
+                    "GDT leader creation failed – the annotation must have a visible "
+                    "leader line connecting to a geometric feature.",
+                    data={
+                        "leader_count": leader_count,
+                        "leader_xy": list(leader_position),
+                        "position_xy": list(frame_position),
+                        "attach_element": attached_element_name
+                                          or requested_attach_name,
+                    },
+                )
+
+            # DrawingGDTs.Add 正常应创建至少一条 Leader，这里读取第一条作为主 Leader。
+            try:
+                primary_leader = leaders.Item(1)
+            except Exception as exc:
+                raise AnnotationOperationError(
+                    "GDT leader creation failed – the annotation must have a visible "
+                    "leader line connecting to a geometric feature.",
+                    data={
+                        "leader_count": leader_count,
+                        "leader_access_error": str(exc),
+                    },
+                ) from exc
+
+            # 如果 attach_element 已成功解析，则进一步尝试把箭头端绑定到真实几何对象。
+            if attached_element_obj is not None:
+                try:
+                    primary_leader.HeadTarget = attached_element_obj
+                    head_target_attached = True
+                except Exception as exc:
+                    # 如果用户显式要求 attach_element，则“坐标接近”不能假装成真正关联。
+                    # 保留 GDT 仍然允许在 leader_xy 显式存在时按坐标创建，但明确警告。
+                    head_target_attached = False
                     warnings.append(
-                        "The automatically created GDT leader could not be fully removed."
+                        "DrawingLeader.HeadTarget could not be attached to "
+                        f"'{attached_element_name or requested_attach_name}': {exc}"
                     )
 
+            # best-effort 设置制图 Leader 的箭头头型。
+            # CATIA 标准属性是 HeadSymbol；枚举值只在运行环境提供明确常量时设置。
+            head_symbol_applied = _try_set_leader_head_symbol(primary_leader)
+
+            if head_symbol_applied is None:
+                warnings.append(
+                    "Leader head symbol was left at the CATIA/default drafting standard "
+                    "because no verified CatSymbolType constant for a filled arrow/dot "
+                    "was available in the current Python COM environment."
+                )
+
+            # 更新后再次验证，避免 Update/SaveEdition 导致 Leader 消失。
             _save_view_edition(view, warnings)
             _update_drawing(sheet, document, warnings)
 
-            leader_count_after_cleanup = _safe_count(leaders)
-            leader_created = bool(
-                leader_xy is not None
-                or (leader_count_after_cleanup is not None and leader_count_after_cleanup > 0)
+            leaders_after_update = _safe_attr(gdt, "Leaders")
+            leader_count_after_update = _safe_count(leaders_after_update)
+
+            if (
+                    leaders_after_update is None
+                    or leader_count_after_update is None
+                    or leader_count_after_update < 1
+            ):
+                raise AnnotationOperationError(
+                    "GDT leader creation failed – the annotation must have a visible "
+                    "leader line connecting to a geometric feature.",
+                    data={
+                        "leader_count_before_update": leader_count,
+                        "leader_count_after_update": leader_count_after_update,
+                        "leader_xy": list(leader_position),
+                        "position_xy": list(frame_position),
+                    },
+                )
+
+            # 更新后重新读取 Leader，避免引用失效。
+            try:
+                primary_leader = leaders_after_update.Item(1)
+            except Exception as exc:
+                raise AnnotationOperationError(
+                    "GDT leader creation failed – the annotation must have a visible "
+                    "leader line connecting to a geometric feature.",
+                    data={
+                        "leader_count_after_update": leader_count_after_update,
+                        "leader_access_error": str(exc),
+                    },
+                ) from exc
+
+            leader_points = _read_leader_points(
+                primary_leader,
+                fallback_start=leader_position,
+                fallback_end=frame_position,
             )
+
+            # 返回明确的 Leader 几何语义：
+            # start = 被测特征/箭头侧
+            # end   = GDT 框侧
+            # bends = 中间折点
+            leader_geometry = {
+                "start_mm": leader_points[0],
+                "end_mm": leader_points[-1],
+                "bend_points_mm": (
+                    leader_points[1:-1]
+                    if len(leader_points) > 2
+                    else []
+                ),
+                "path_points_mm": leader_points,
+            }
+
+            # 如果 attach_element 被解析，则优先验证 HeadTarget。
+            # 如果没有 attach_element，则 leader_xy 本身来自 Agent 前置几何查询，
+            # 因而可认为该 Leader 已按坐标附着。
+            if attached_element_obj is not None:
+                leader_attached = bool(
+                    leader_count_after_update >= 1
+                    and head_target_attached
+                )
+                attachment_method = (
+                    "head_target"
+                    if head_target_attached
+                    else "coordinate_only"
+                )
+            else:
+                leader_attached = bool(leader_count_after_update >= 1)
+                attachment_method = "leader_xy"
+
             return _success(
                 {
                     "annotation_type": "DrawingGDT",
@@ -2692,7 +4159,9 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "gdt_index": created_index,
                     "gdts_count_before": before_count,
                     "gdts_count_after": created_index,
-                    "view_name": str(_safe_attr(view, "Name", view_name)),
+                    "view_name": str(
+                        _safe_attr(view, "Name", view_name)
+                    ),
                     "symbol_type": canonical_symbol,
                     "symbol_code": symbol_code,
                     "actual_symbol_code": actual_symbol_code,
@@ -2703,15 +4172,28 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     ),
                     "tolerance_value": tolerance,
                     "datum_references": datums,
+
+                    # GDT 框位置。
                     "position_mm": list(frame_position),
-                    "leader_requested": leader_xy is not None,
-                    "leader_created": leader_created,
-                    "leader_position_mm": (
-                        list(leader_position) if leader_created else None
-                    ),
-                    "leader_count_before_cleanup": leader_count_before_cleanup,
-                    "leader_count_after_cleanup": leader_count_after_cleanup,
-                    "leader_cleanup_attempts": leader_cleanup_attempts,
+
+                    # Leader 几何与请求信息。
+                    "leader_requested": True,
+                    "leader_created": True,
+                    "leader_attached": leader_attached,
+                    "leader_position_mm": list(leader_position),
+                    "leader_position_source": leader_position_source,
+                    "leader_count": leader_count_after_update,
+                    "leader_geometry": leader_geometry,
+
+                    # 几何元素关联信息。
+                    "attach_element_requested": requested_attach_name,
+                    "attach_element_name": attached_element_name,
+                    "head_target_attached": head_target_attached,
+                    "attachment_method": attachment_method,
+
+                    # 箭头样式属于 best-effort，不影响 GDT 成功判定。
+                    "leader_head_symbol_applied": head_symbol_applied,
+
                     "encoded_text": encoded_text,
                     "native_drawing_gdt_created": True,
                     "model_modified": True,
@@ -2719,33 +4201,59 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 },
                 warnings,
             )
+
         except Exception as exc:
+            # ---------------------------------------------------------------
+            # 保留原有回滚模式。
+            #
+            # Leader 校验、HeadTarget 前后的任何硬失败都会进入这里，并删除刚创建
+            # 的 DrawingGDT。由于 Leader 属于 GDT，本体删除后其 Leader 一并回滚。
+            # ---------------------------------------------------------------
             cleanup = {
                 "attempted": False,
                 "succeeded": True,
                 "verified": True,
             }
+
             if gdts is not None:
                 current_count = _safe_count(gdts)
-                if created_index is None and before_count is not None and current_count is not None:
+
+                if (
+                        created_index is None
+                        and before_count is not None
+                        and current_count is not None
+                ):
                     if current_count > before_count:
                         created_index = current_count
+
                 if created_index is not None:
                     cleanup = _remove_collection_item(
                         gdts,
                         index=created_index,
                         name=str(_safe_attr(gdt, "Name", "")),
                     )
-            count_after_cleanup = _safe_count(gdts) if gdts is not None else None
+
+            count_after_cleanup = (
+                _safe_count(gdts)
+                if gdts is not None
+                else None
+            )
+
             cleanup_verified = bool(
                 cleanup.get("verified", True)
                 and (
-                    before_count is None
-                    or count_after_cleanup is None
-                    or count_after_cleanup == before_count
+                        before_count is None
+                        or count_after_cleanup is None
+                        or count_after_cleanup == before_count
                 )
             )
-            inherited_data = exc.data if isinstance(exc, AnnotationOperationError) else None
+
+            inherited_data = (
+                exc.data
+                if isinstance(exc, AnnotationOperationError)
+                else None
+            )
+
             return _error(
                 "catia_create_gdt_frame",
                 exc,
@@ -2757,13 +4265,23 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "rollback_verified": cleanup_verified,
                     "model_modified": not cleanup_verified,
                     "document_save_required": not cleanup_verified,
+
+                    # 即使失败，也返回本次尝试的附着目标，便于 MCP Agent
+                    # 决定是否重新查询几何、重新选择 leader_xy 后重试。
+                    "attach_element_name": attached_element_name,
                 },
                 warnings=warnings,
                 status=(
                     "capability_unavailable"
-                    if isinstance(exc, CapabilityUnavailableError)
-                    and cleanup_verified
-                    else ("error" if cleanup_verified else "partial_success")
+                    if (
+                            isinstance(exc, CapabilityUnavailableError)
+                            and cleanup_verified
+                    )
+                    else (
+                        "error"
+                        if cleanup_verified
+                        else "partial_success"
+                    )
                 ),
             )
 
