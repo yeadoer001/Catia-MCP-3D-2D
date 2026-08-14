@@ -29,7 +29,7 @@ import math
 from typing import Any, Optional
 
 
-IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-12-v1"
+IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-14-v2-size-fallback"
 _CATVB_SCRIPT_LANGUAGE = 1
 _EPS = 1.0e-9
 
@@ -437,6 +437,109 @@ def _view_transform(view: Any) -> dict[str, float]:
     }
 
 
+
+_DRAWING_VIEW_SIZE_VBS = r'''
+Public Function MCP_GetDrawingViewSize(viewObject)
+    Dim values(3)
+    viewObject.Size values
+    MCP_GetDrawingViewSize = Array( _
+        CDbl(values(0)), CDbl(values(1)), _
+        CDbl(values(2)), CDbl(values(3)))
+End Function
+'''
+
+
+def _drawing_view_size(application: Any, view: Any) -> dict[str, float]:
+    """Read DrawingView.Size through CATIA SystemService.Evaluate."""
+    try:
+        raw = _evaluate(
+            application,
+            _DRAWING_VIEW_SIZE_VBS,
+            "MCP_GetDrawingViewSize",
+            [view],
+        )
+        values = [float(item) for item in list(raw)]
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read DrawingView.Size through CATIA: {_format_error(exc)}"
+        ) from exc
+
+    if len(values) != 4 or not all(math.isfinite(item) for item in values):
+        raise RuntimeError("DrawingView.Size did not return four finite values")
+
+    xmin, xmax, ymin, ymax = values
+    if xmax < xmin or ymax < ymin:
+        raise RuntimeError("DrawingView.Size returned an inverted bounding box")
+
+    return {
+        "xmin": xmin,
+        "xmax": xmax,
+        "ymin": ymin,
+        "ymax": ymax,
+        "width_mm": xmax - xmin,
+        "height_mm": ymax - ymin,
+    }
+
+
+def _view_bounds_dimension_anchors(
+    application: Any,
+    view: Any,
+    kind: str,
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    """Build horizontal/vertical dimension anchors from DrawingView.Size."""
+    size = _drawing_view_size(application, view)
+    tf = _view_transform(view)
+
+    sheet_corners = [
+        (size["xmin"], size["ymin"]),
+        (size["xmin"], size["ymax"]),
+        (size["xmax"], size["ymin"]),
+        (size["xmax"], size["ymax"]),
+    ]
+    local_corners = [_sheet_to_view(x, y, tf) for x, y in sheet_corners]
+
+    xmin = min(point[0] for point in local_corners)
+    xmax = max(point[0] for point in local_corners)
+    ymin = min(point[1] for point in local_corners)
+    ymax = max(point[1] for point in local_corners)
+
+    if kind == "horizontal_distance":
+        y = (ymin + ymax) / 2.0
+        p = (xmin, y)
+        q = (xmax, y)
+        expected = abs(xmax - xmin)
+    elif kind == "vertical_distance":
+        x = (xmin + xmax) / 2.0
+        p = (x, ymin)
+        q = (x, ymax)
+        expected = abs(ymax - ymin)
+    else:
+        raise ValueError(
+            "DrawingView.Size fallback only supports horizontal_distance "
+            "and vertical_distance"
+        )
+
+    if expected <= _EPS:
+        raise ValueError(f"DrawingView.Size fallback produced zero {kind} extent")
+
+    evidence = {
+        "mode": "drawing_view_size_fallback",
+        "size_sheet_mm": size,
+        "view_bounds_mm": {
+            "xmin": xmin,
+            "xmax": xmax,
+            "ymin": ymin,
+            "ymax": ymax,
+            "width_mm": xmax - xmin,
+            "height_mm": ymax - ymin,
+        },
+        "anchor1_view_mm": list(p),
+        "anchor2_view_mm": list(q),
+        "associative_to_projected_model_geometry": False,
+    }
+    return expected, p, q, evidence
+
+
 def _sheet_to_view(x: float, y: float, tf: dict[str, float]) -> tuple[float, float]:
     dx = x - tf["origin_sheet_x_mm"]
     dy = y - tf["origin_sheet_y_mm"]
@@ -560,28 +663,121 @@ def _add_internal(
     tolerance_display_mode: int,
 ) -> tuple[dict[str, Any], list[str]]:
     kind = str(kind).strip().lower()
-    obj1, idx1 = _geometry(view, element1)
-    a = _describe(application, obj1, idx1)
-    obj2 = None
-    b = None
-    if element2 is not None:
-        obj2, idx2 = _geometry(view, element2)
-        b = _describe(application, obj2, idx2)
-    _validate_kind(kind, a, b)
-    expected, anchor1, anchor2, unit = _expected_and_anchors(kind, a, b)
-    cat_obj1, cat_obj2 = _catia_geometry_objects(kind, obj1, obj2)
+
+    # Keep the original associative-geometry path.  Only horizontal/vertical
+    # dimensions get a controlled fallback when the requested element selector
+    # cannot be resolved in a generated view.
+    fallback_evidence: Optional[dict[str, Any]] = None
+    helper_points: list[Any] = []
+    fallback_mode = False
+
+    try:
+        obj1, idx1 = _geometry(view, element1)
+        a = _describe(application, obj1, idx1)
+        obj2 = None
+        b = None
+        if element2 is not None:
+            obj2, idx2 = _geometry(view, element2)
+            b = _describe(application, obj2, idx2)
+        _validate_kind(kind, a, b)
+        expected, anchor1, anchor2, unit = _expected_and_anchors(kind, a, b)
+        cat_obj1, cat_obj2 = _catia_geometry_objects(kind, obj1, obj2)
+    except Exception as primary_exc:
+        if kind not in {"horizontal_distance", "vertical_distance"}:
+            raise
+
+        expected, anchor1, anchor2, fallback_evidence = _view_bounds_dimension_anchors(
+            application, view, kind
+        )
+        fallback_mode = True
+        obj1 = None
+        obj2 = None
+        idx1 = -1
+        a = {
+            "index": None,
+            "name": "DrawingView.Size@lower_x/upper_x" if kind == "horizontal_distance" else "DrawingView.Size@lower_y/upper_y",
+            "automation_type": "DrawingView.Size bounding-box fallback",
+            "has_range_box": True,
+            "range_box_view_mm": fallback_evidence["view_bounds_mm"],
+            "location_kind": "point",
+            "location_view_mm": list(anchor1),
+            "radius_mm": None,
+            "direction": None,
+        }
+        b = {
+            "index": None,
+            "name": "DrawingView.Size@upper_x" if kind == "horizontal_distance" else "DrawingView.Size@upper_y",
+            "automation_type": "DrawingView.Size bounding-box fallback",
+            "has_range_box": True,
+            "range_box_view_mm": fallback_evidence["view_bounds_mm"],
+            "location_kind": "point",
+            "location_view_mm": list(anchor2),
+            "radius_mm": None,
+            "direction": None,
+        }
+        unit = "length_mm"
+        cat_obj1 = None
+        cat_obj2 = None
 
     rep = {
         "horizontal_distance": "horizontal",
         "vertical_distance": "vertical",
         "aligned_distance": "true",
     }.get(kind, "auto")
+
     if witness_points is None:
         witnesses = [anchor1[0], anchor1[1], anchor2[0], anchor2[1]]
     else:
         if len(witness_points) != 4:
             raise ValueError("witness_points must be [x1,y1,x2,y2] in view coordinates")
         witnesses = [_finite(v, f"witness_points[{i}]") for i, v in enumerate(witness_points)]
+
+    warnings: list[str] = []
+
+    if fallback_mode:
+        geometry_before = _safe_count(_safe_attr(view, "GeometricElements"))
+        try:
+            factory = view.Factory2D
+            helper_points = [
+                factory.CreatePoint(anchor1[0], anchor1[1]),
+                factory.CreatePoint(anchor2[0], anchor2[1]),
+            ]
+        except Exception as exc:
+            raise RuntimeError(
+                "DrawingView.Size fallback could not create helper Point2D objects: "
+                f"{_format_error(exc)}"
+            ) from exc
+
+        geometry_after = _safe_count(_safe_attr(view, "GeometricElements"))
+        fallback_evidence["helper_point_objects_created"] = True
+        fallback_evidence["geometry_count_before_helper_points"] = geometry_before
+        fallback_evidence["geometry_count_after_helper_points"] = geometry_after
+        if (
+            geometry_before is not None
+            and geometry_after is not None
+            and geometry_after != geometry_before + 2
+        ):
+            _delete_objects(document, helper_points)
+            raise AnnotationOperationError(
+                "Fallback helper Point2D creation did not produce the expected "
+                "geometry-count delta.",
+                data={
+                    "geometry_count_before": geometry_before,
+                    "geometry_count_after": geometry_after,
+                    "expected_delta": 2,
+                    "dimension_kind": kind,
+                },
+            )
+        cat_obj1 = helper_points[0]
+        cat_obj2 = helper_points[1]
+        warnings.append(
+            "The requested geometry selector could not be resolved; "
+            f"{kind} was created from DrawingView.Size bounding-box extents "
+            "using hidden helper Point2D supports."
+        )
+        warnings.append(
+            f"Original geometry-selection failure: {_format_error(primary_exc)}"
+        )
 
     before = int(view.Dimensions.Count)
     dim = _evaluate(
@@ -603,22 +799,35 @@ def _add_internal(
                 f"dimension count changed from {before} to {created_index}; expected +1"
             )
     except Exception:
-        # Do not leave an unreported annotation behind when creation verification
-        # or naming fails.
         try:
             if int(view.Dimensions.Count) > before:
                 view.Dimensions.Remove(int(view.Dimensions.Count))
         except Exception:
             pass
+        if helper_points:
+            try:
+                _delete_objects(document, helper_points)
+            except Exception:
+                pass
         raise
+
+    if helper_points:
+        hidden, hide_error = _hide_objects(document, helper_points)
+        if not hidden and hide_error:
+            warnings.append(
+                "Fallback helper Point2D objects were created but could not be hidden: "
+                f"{hide_error}"
+            )
 
     tf = _view_transform(view)
     offset = _finite(offset_mm, "offset_mm")
     if position_x is None and position_y is None:
         vx, vy = _auto_position(kind, anchor1, anchor2, offset, tf["scale"])
-        resolved_from = "automatic_feature_offset"
+        resolved_from = "drawing_view_size_fallback" if fallback_mode else "automatic_feature_offset"
     elif position_x is None or position_y is None:
         view.Dimensions.Remove(created_index)
+        if helper_points:
+            _delete_objects(document, helper_points)
         raise ValueError("position_x and position_y must be supplied together")
     else:
         px = _finite(position_x, "position_x")
@@ -632,9 +841,11 @@ def _add_internal(
             resolved_from = "explicit_view_coordinates"
         else:
             view.Dimensions.Remove(created_index)
+            if helper_points:
+                _delete_objects(document, helper_points)
             raise ValueError("position_space must be 'view' or 'sheet'")
 
-    warnings: list[str] = []
+    tolerance_set = False
     try:
         try:
             dim.ValueAutoMode = False
@@ -645,8 +856,6 @@ def _add_internal(
             application, dim, tolerance_upper, tolerance_lower, tolerance_display_mode
         )
         warnings.extend(_update(document, sheet, view))
-        # CATIA updates can recompute the annotation. Re-apply and verify the requested
-        # position after the update; this is intentional, not a duplicate move.
         dim.MoveValue(float(vx), float(vy), 0, 0)
         try:
             view.SaveEdition()
@@ -658,6 +867,13 @@ def _add_internal(
             view.Dimensions.Remove(created_index)
         except Exception as cleanup_exc:
             cleanup_error = _format_error(cleanup_exc)
+        if helper_points:
+            try:
+                support_cleanup = _delete_objects(document, helper_points)
+                if not support_cleanup.get("succeeded", True):
+                    cleanup_error = ((cleanup_error + "; ") if cleanup_error else "") + str(support_cleanup.get("error"))
+            except Exception as support_exc:
+                cleanup_error = ((cleanup_error + "; ") if cleanup_error else "") + _format_error(support_exc)
         message = f"dimension post-processing failed: {_format_error(exc)}"
         if cleanup_error:
             message += f"; rollback also failed: {cleanup_error}"
@@ -686,7 +902,9 @@ def _add_internal(
         "catia_line_rep": int(getattr(dim.GetDimLine(), "DimLineRep", -1)),
         "element1": a,
         "element2": b,
-        "associative_geometry": True,
+        "associative_geometry": not fallback_mode,
+        "support_mode": "drawing_view_size_hidden_helper_points" if fallback_mode else "original_drawing_geometry",
+        "fallback_evidence": fallback_evidence,
         "expected_value": expected,
         "catia_measured_value": actual,
         "value_unit": unit,
@@ -790,6 +1008,11 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         With position_space='sheet', coordinates are rigorously converted using
         view origin, rotation and scale. If position is omitted, a feature-based
         offset in paper millimetres is used.
+
+        For horizontal_distance/vertical_distance, if the requested element
+        selectors cannot be resolved in the DrawingView, the tool falls back
+        to the verified DrawingView.Size bounding box and creates hidden helper
+        Point2D supports.
         """
         try:
             application, document, sheet, view = _active_context(conn, view_name)
