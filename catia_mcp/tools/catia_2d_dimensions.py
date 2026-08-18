@@ -29,7 +29,7 @@ import math
 from typing import Any, Optional
 
 
-IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-14-v2-size-fallback"
+IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-18-v4-full-semantic-layout"
 _CATVB_SCRIPT_LANGUAGE = 1
 _EPS = 1.0e-9
 
@@ -44,7 +44,7 @@ SUPPORTED_KINDS = {
     "radius": "Associative radial dimension on a Circle2D.",
     "diameter": "Associative diameter dimension on a Circle2D.",
     "angle": "Angle between two Line2D objects.",
-    "line_length": "Length of one bounded Line2D/Curve2D.",
+    "line_length": "Length of one bounded Line2D using its visible segment endpoints.",
 }
 
 LINE_REP = {
@@ -196,6 +196,71 @@ def _error(message: str, data: Any = None) -> dict[str, Any]:
     return result
 
 
+class AnnotationOperationError(RuntimeError):
+    """Operation error carrying optional diagnostic data."""
+
+    def __init__(self, message: str, *, data: Any = None) -> None:
+        super().__init__(message)
+        self.data = data
+
+
+def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _safe_count(collection: Any) -> Optional[int]:
+    try:
+        return int(collection.Count)
+    except Exception:
+        return None
+
+
+def _hide_objects(document: Any, objects: list[Any]) -> tuple[bool, Optional[str]]:
+    selection = None
+    try:
+        selection = document.Selection
+        selection.Clear()
+        for obj in objects:
+            selection.Add(obj)
+        selection.VisProperties.SetShow(1)
+        return True, None
+    except Exception as exc:
+        return False, _format_error(exc)
+    finally:
+        if selection is not None:
+            try:
+                selection.Clear()
+            except Exception:
+                pass
+
+
+def _delete_objects(document: Any, objects: list[Any]) -> dict[str, Any]:
+    result = {"attempted": bool(objects), "succeeded": True, "error": None}
+    if not objects:
+        return result
+    selection = None
+    try:
+        selection = document.Selection
+        selection.Clear()
+        for obj in objects:
+            selection.Add(obj)
+        selection.Delete()
+        return result
+    except Exception as exc:
+        result["succeeded"] = False
+        result["error"] = _format_error(exc)
+        return result
+    finally:
+        if selection is not None:
+            try:
+                selection.Clear()
+            except Exception:
+                pass
+
+
 def _finite(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
@@ -311,13 +376,33 @@ def _center(item: dict[str, Any]) -> tuple[float, float]:
     return tuple(item["location_view_mm"])  # type: ignore[return-value]
 
 
-def _point(item: dict[str, Any]) -> tuple[float, float]:
-    if item["location_kind"] in {"point", "center", "line"}:
-        return tuple(item["location_view_mm"])  # type: ignore[return-value]
+def _bbox_center(item: dict[str, Any]) -> tuple[float, float]:
     box = item.get("range_box_view_mm")
-    if box:
-        return ((box["xmin"] + box["xmax"]) / 2, (box["ymin"] + box["ymax"]) / 2)
-    raise ValueError(f"geometry {item['index']} has no usable anchor")
+    if not box:
+        raise ValueError(f"geometry {item.get('index')} has no range box")
+    return ((float(box["xmin"]) + float(box["xmax"])) / 2.0,
+            (float(box["ymin"]) + float(box["ymax"])) / 2.0)
+
+
+def _point(item: dict[str, Any]) -> tuple[float, float]:
+    """Return a visually meaningful anchor, never a Line2D origin by default.
+
+    Point/centre geometry keeps its native coordinate.  Line2D uses the midpoint of
+    its visible segment; other bounded curves use their range-box centre as a
+    conservative fallback.  This avoids the old failure where GetOrigin() could be
+    near or outside the visible segment.
+    """
+    kind = str(item.get("location_kind", ""))
+    if kind in {"point", "center"}:
+        return tuple(item["location_view_mm"])  # type: ignore[return-value]
+    if kind == "line" and item.get("direction") and item.get("range_box_view_mm"):
+        p0, p1 = _line_visible_segment(item)
+        return ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
+    if item.get("range_box_view_mm"):
+        return _bbox_center(item)
+    if kind == "line":
+        return tuple(item["location_view_mm"])  # type: ignore[return-value]
+    raise ValueError(f"geometry {item.get('index')} has no usable anchor")
 
 
 def _line(item: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -333,20 +418,301 @@ def _line(item: dict[str, Any]) -> tuple[float, float, float, float]:
     return x, y, dx / length, dy / length
 
 
-def _range_endpoints(item: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
+def _line_visible_segment(
+    item: dict[str, Any],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Recover the visible Line2D segment from its line equation + range box.
+
+    CATIA Line2D.GetOrigin() returns a point on the underlying line, but that point
+    is not guaranteed to be the visual centre of the projected segment.  For
+    dimension placement we therefore intersect the infinite line with the
+    geometry RangeBox and use the two visible boundary intersections.
+    """
     box = item.get("range_box_view_mm")
     if not box:
         raise ValueError(f"geometry {item['index']} has no range box")
-    if item["direction"]:
-        dx, dy = item["direction"]
-        candidates = [
-            (box["xmin"], box["ymin"]), (box["xmin"], box["ymax"]),
-            (box["xmax"], box["ymin"]), (box["xmax"], box["ymax"]),
-        ]
-        projected = sorted(candidates, key=lambda p: p[0] * dx + p[1] * dy)
-        return projected[0], projected[-1]
+
+    x0, y0, ux, uy = _line(item)
+    xmin, xmax = float(box["xmin"]), float(box["xmax"])
+    ymin, ymax = float(box["ymin"]), float(box["ymax"])
+    tolerance = 1.0e-7
+    candidates: list[tuple[float, tuple[float, float]]] = []
+
+    def add_candidate(t: float) -> None:
+        x = x0 + t * ux
+        y = y0 + t * uy
+        if (
+            xmin - tolerance <= x <= xmax + tolerance
+            and ymin - tolerance <= y <= ymax + tolerance
+        ):
+            for old_t, _ in candidates:
+                if abs(old_t - t) <= tolerance:
+                    return
+            candidates.append((t, (x, y)))
+
+    if abs(ux) > _EPS:
+        add_candidate((xmin - x0) / ux)
+        add_candidate((xmax - x0) / ux)
+    if abs(uy) > _EPS:
+        add_candidate((ymin - y0) / uy)
+        add_candidate((ymax - y0) / uy)
+
+    if len(candidates) >= 2:
+        candidates.sort(key=lambda entry: entry[0])
+        return candidates[0][1], candidates[-1][1]
+
+    # Degenerate/numerically tiny range boxes: keep a conservative fallback.
+    corners = [
+        (xmin, ymin), (xmin, ymax), (xmax, ymin), (xmax, ymax),
+    ]
+    projected = sorted(
+        corners,
+        key=lambda p: (p[0] - x0) * ux + (p[1] - y0) * uy,
+    )
+    return projected[0], projected[-1]
+
+
+def _range_endpoints(
+    item: dict[str, Any],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    if item.get("location_kind") == "line" and item.get("direction"):
+        return _line_visible_segment(item)
+    box = item.get("range_box_view_mm")
+    if not box:
+        raise ValueError(f"geometry {item['index']} has no range box")
     return (box["xmin"], box["ymin"]), (box["xmax"], box["ymax"])
 
+
+def _parallel_line_dimension_geometry(
+    a: dict[str, Any],
+    b: dict[str, Any],
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    """Choose dimension anchors in the common visible span of two parallel lines.
+
+    The old implementation used Line2D.GetOrigin() from line A and projected it
+    onto line B.  That is mathematically valid for the distance, but the origin can
+    lie near an end or even outside the visually useful common span.  Here we use
+    each line's visible segment and choose the centre of their overlapping span
+    along the line direction.
+    """
+    x1, y1, ux1, uy1 = _line(a)
+    x2, y2, ux2, uy2 = _line(b)
+    cross = ux1 * uy2 - uy1 * ux2
+    if abs(cross) > 1.0e-5:
+        raise ValueError("line_to_line requires parallel lines; use kind='angle'")
+
+    # Keep both directions consistent so longitudinal parameters compare cleanly.
+    if ux1 * ux2 + uy1 * uy2 < 0.0:
+        ux2, uy2 = -ux2, -uy2
+
+    n1x, n1y = -uy1, ux1
+    signed_distance = (x2 - x1) * n1x + (y2 - y1) * n1y
+    distance = abs(signed_distance)
+
+    a0, a1 = _line_visible_segment(a)
+    b0, b1 = _line_visible_segment(b)
+
+    def longitudinal(point: tuple[float, float]) -> float:
+        return point[0] * ux1 + point[1] * uy1
+
+    a_lo, a_hi = sorted((longitudinal(a0), longitudinal(a1)))
+    b_lo, b_hi = sorted((longitudinal(b0), longitudinal(b1)))
+    overlap_lo = max(a_lo, b_lo)
+    overlap_hi = min(a_hi, b_hi)
+
+    if overlap_lo <= overlap_hi + 1.0e-7:
+        longitudinal_target = (overlap_lo + overlap_hi) / 2.0
+        span_mode = "visible_overlap_midpoint"
+    else:
+        # No common projected span: choose the midpoint between the nearest ends.
+        if a_hi < b_lo:
+            longitudinal_target = (a_hi + b_lo) / 2.0
+        else:
+            longitudinal_target = (b_hi + a_lo) / 2.0
+        span_mode = "nearest_visible_span_midpoint_no_overlap"
+
+    # Point p lies on A at the selected longitudinal station.
+    t1 = longitudinal_target - (x1 * ux1 + y1 * uy1)
+    p = (x1 + t1 * ux1, y1 + t1 * uy1)
+
+    # q is the normal projection of p onto B.
+    q = (p[0] + signed_distance * n1x, p[1] + signed_distance * n1y)
+
+    evidence = {
+        "strategy": "parallel_line_common_visible_span",
+        "line1_visible_segment_view_mm": [list(a0), list(a1)],
+        "line2_visible_segment_view_mm": [list(b0), list(b1)],
+        "line1_longitudinal_interval": [a_lo, a_hi],
+        "line2_longitudinal_interval": [b_lo, b_hi],
+        "overlap_interval": [overlap_lo, overlap_hi],
+        "span_mode": span_mode,
+        "chosen_longitudinal_coordinate": longitudinal_target,
+        "anchor1_view_mm": list(p),
+        "anchor2_view_mm": list(q),
+        "distance_mm": distance,
+        "line_direction": [ux1, uy1],
+    }
+    return distance, p, q, evidence
+
+
+
+def _line_intersection(
+    a: dict[str, Any], b: dict[str, Any]
+) -> tuple[float, float]:
+    x1, y1, ux1, uy1 = _line(a)
+    x2, y2, ux2, uy2 = _line(b)
+    det = ux1 * uy2 - uy1 * ux2
+    if abs(det) <= 1.0e-7:
+        raise ValueError("angle requires two non-parallel Line2D objects")
+    dx, dy = x2 - x1, y2 - y1
+    t = (dx * uy2 - dy * ux2) / det
+    return x1 + t * ux1, y1 + t * uy1
+
+
+def _ray_toward_visible_segment(
+    item: dict[str, Any], vertex: tuple[float, float]
+) -> tuple[float, float]:
+    """Choose the line direction that points from the vertex toward visible geometry."""
+    _, _, ux, uy = _line(item)
+    try:
+        a0, a1 = _line_visible_segment(item)
+        mx, my = (a0[0] + a1[0]) / 2.0, (a0[1] + a1[1]) / 2.0
+        if (mx - vertex[0]) * ux + (my - vertex[1]) * uy < 0.0:
+            ux, uy = -ux, -uy
+    except Exception:
+        pass
+    return ux, uy
+
+
+def _angle_dimension_geometry(
+    a: dict[str, Any], b: dict[str, Any]
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    """Build angle anchors from the actual line intersection and visible rays."""
+    vertex = _line_intersection(a, b)
+    u1 = _ray_toward_visible_segment(a, vertex)
+    u2 = _ray_toward_visible_segment(b, vertex)
+    dot = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
+    angle = math.acos(dot)
+    # Prefer the smaller included angle; CATIA's catDimAngle can still choose its
+    # own representation, but the witness points now identify the intended sector.
+    if angle > math.pi:
+        angle = 2.0 * math.pi - angle
+    try:
+        s10, s11 = _line_visible_segment(a)
+        s20, s21 = _line_visible_segment(b)
+        len1 = max(math.dist(vertex, s10), math.dist(vertex, s11))
+        len2 = max(math.dist(vertex, s20), math.dist(vertex, s21))
+        radius = max(3.0, min(len1, len2) * 0.35)
+    except Exception:
+        radius = 10.0
+    p = (vertex[0] + u1[0] * radius, vertex[1] + u1[1] * radius)
+    q = (vertex[0] + u2[0] * radius, vertex[1] + u2[1] * radius)
+    bisector = (u1[0] + u2[0], u1[1] + u2[1])
+    bisector_norm = math.hypot(*bisector)
+    if bisector_norm <= _EPS:
+        bisector = (-u1[1], u1[0])
+        bisector_norm = 1.0
+    bisector = (bisector[0] / bisector_norm, bisector[1] / bisector_norm)
+    evidence = {
+        "strategy": "angle_vertex_visible_rays",
+        "vertex_view_mm": list(vertex),
+        "ray1": list(u1),
+        "ray2": list(u2),
+        "bisector": list(bisector),
+        "witness_radius_view_mm": radius,
+        "anchor1_view_mm": list(p),
+        "anchor2_view_mm": list(q),
+        "angle_radians": angle,
+    }
+    return angle, p, q, evidence
+
+
+def _axis_distance_geometry(
+    kind: str, a: dict[str, Any], b: dict[str, Any]
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    """Select visually meaningful anchors for horizontal/vertical dimensions."""
+    pa = _point(a)
+    pb = _point(b)
+    evidence: dict[str, Any] = {"strategy": "visual_anchor_axis_distance"}
+    # If both supports are lines, use their visible spans rather than line origins.
+    if a.get("location_kind") == "line" and b.get("location_kind") == "line":
+        a0, a1 = _line_visible_segment(a)
+        b0, b1 = _line_visible_segment(b)
+        if kind == "horizontal_distance":
+            ay = (a0[1] + a1[1]) / 2.0
+            by = (b0[1] + b1[1]) / 2.0
+            # Choose endpoints/points nearest in X so witness lines do not span the view arbitrarily.
+            pair = min(((x, y) for x, y in (a0, a1) for _x, _y in [b0, b1]), key=lambda p: 0.0)
+            candidates = [((x1, y1), (x2, y2)) for x1, y1 in (a0, a1) for x2, y2 in (b0, b1)]
+            p, q = min(candidates, key=lambda pair: abs(pair[1][0] - pair[0][0]))
+            p, q = (p[0], ay), (q[0], by)
+        else:
+            ax = (a0[0] + a1[0]) / 2.0
+            bx = (b0[0] + b1[0]) / 2.0
+            candidates = [((x1, y1), (x2, y2)) for x1, y1 in (a0, a1) for x2, y2 in (b0, b1)]
+            p, q = min(candidates, key=lambda pair: abs(pair[1][1] - pair[0][1]))
+            p, q = (ax, p[1]), (bx, q[1])
+        evidence.update({
+            "strategy": "visible_line_segments_axis_distance",
+            "line1_visible_segment_view_mm": [list(a0), list(a1)],
+            "line2_visible_segment_view_mm": [list(b0), list(b1)],
+        })
+    else:
+        p, q = pa, pb
+    value = abs(q[0] - p[0]) if kind == "horizontal_distance" else abs(q[1] - p[1])
+    evidence["anchor1_view_mm"] = list(p)
+    evidence["anchor2_view_mm"] = list(q)
+    evidence["distance_mm"] = value
+    return value, p, q, evidence
+
+
+def _circle_dimension_geometry(
+    kind: str, item: dict[str, Any]
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    c = _center(item)
+    r = float(item["radius_mm"])
+    # Anchors identify actual geometry. Placement is decided later from free-space scoring.
+    p = (c[0] + r, c[1])
+    q = c if kind == "radius" else (c[0] - r, c[1])
+    return (r if kind == "radius" else 2.0 * r), p, q, {
+        "strategy": "circle_center_and_diameter_axis",
+        "center_view_mm": list(c),
+        "radius_mm": r,
+        "anchor1_view_mm": list(p),
+        "anchor2_view_mm": list(q),
+    }
+
+
+def _center_to_line_geometry(
+    circle: dict[str, Any], line: dict[str, Any]
+) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
+    p = _center(circle)
+    x, y, dx, dy = _line(line)
+    signed = (p[0] - x) * (-dy) + (p[1] - y) * dx
+    q = (p[0] - signed * (-dy), p[1] - signed * dx)
+    # Clamp the visual witness to the nearest point on the visible segment if the
+    # perpendicular foot lies beyond it. Value remains the support-line distance.
+    try:
+        s0, s1 = _line_visible_segment(line)
+        seg_dx, seg_dy = s1[0] - s0[0], s1[1] - s0[1]
+        seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy
+        if seg_len2 > _EPS:
+            t = ((q[0] - s0[0]) * seg_dx + (q[1] - s0[1]) * seg_dy) / seg_len2
+            if t < 0.0 or t > 1.0:
+                q_visual = s0 if t < 0.0 else s1
+            else:
+                q_visual = q
+        else:
+            q_visual = q
+    except Exception:
+        q_visual = q
+    return abs(signed), p, q_visual, {
+        "strategy": "center_to_visible_line_projection",
+        "center_view_mm": list(p),
+        "infinite_line_projection_view_mm": list(q),
+        "visual_line_anchor_view_mm": list(q_visual),
+        "distance_mm": abs(signed),
+    }
 
 def _validate_kind(kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]) -> None:
     if kind not in SUPPORTED_KINDS:
@@ -360,6 +726,8 @@ def _validate_kind(kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]) ->
     if kind in {"line_to_line", "angle"}:
         _line(a)
         _line(b or {})
+    if kind == "line_length":
+        _line(a)
     if kind == "center_to_line":
         _center(a)
         _line(b or {})
@@ -382,47 +750,46 @@ def _catia_geometry_objects(
 
 def _expected_and_anchors(
     kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]
-) -> tuple[Optional[float], tuple[float, float], tuple[float, float], str]:
+) -> tuple[Optional[float], tuple[float, float], tuple[float, float], str, dict[str, Any]]:
+    evidence: dict[str, Any] = {"strategy": "default_geometry_anchor"}
     if kind in {"radius", "diameter"}:
-        c = _center(a)
-        r = float(a["radius_mm"])
-        return (r if kind == "radius" else 2 * r), (c[0] + r, c[1]), c, "length_mm"
+        value, p, q, evidence = _circle_dimension_geometry(kind, a)
+        return value, p, q, "length_mm", evidence
     if kind == "line_length":
         p1, p2 = _range_endpoints(a)
-        return math.dist(p1, p2), p1, p2, "length_mm"
+        evidence = {
+            "strategy": "visible_bounded_geometry_endpoints",
+            "anchor1_view_mm": list(p1),
+            "anchor2_view_mm": list(p2),
+        }
+        return math.dist(p1, p2), p1, p2, "length_mm", evidence
     assert b is not None
     if kind == "center_to_line":
-        p = _center(a)
-        x, y, dx, dy = _line(b)
-        signed = (p[0] - x) * (-dy) + (p[1] - y) * dx
-        q = (p[0] - signed * (-dy), p[1] - signed * dx)
-        return abs(signed), p, q, "length_mm"
+        value, p, q, evidence = _center_to_line_geometry(a, b)
+        return value, p, q, "length_mm", evidence
     if kind == "center_to_center":
         p, q = _center(a), _center(b)
-        return math.dist(p, q), p, q, "length_mm"
+        return math.dist(p, q), p, q, "length_mm", {
+            "strategy": "center_to_center_midline",
+            "anchor1_view_mm": list(p),
+            "anchor2_view_mm": list(q),
+        }
     if kind == "line_to_line":
-        x1, y1, dx1, dy1 = _line(a)
-        x2, y2, dx2, dy2 = _line(b)
-        cross = dx1 * dy2 - dy1 * dx2
-        if abs(cross) > 1.0e-5:
-            raise ValueError("line_to_line requires parallel lines; use kind='angle'")
-        signed = (x2 - x1) * (-dy1) + (y2 - y1) * dx1
-        p = (x1, y1)
-        q = (x1 + signed * (-dy1), y1 + signed * dx1)
-        return abs(signed), p, q, "length_mm"
+        value, p, q, line_evidence = _parallel_line_dimension_geometry(a, b)
+        return value, p, q, "length_mm", line_evidence
     if kind == "angle":
-        x1, y1, dx1, dy1 = _line(a)
-        x2, y2, dx2, dy2 = _line(b)
-        angle = math.acos(max(-1.0, min(1.0, abs(dx1 * dx2 + dy1 * dy2))))
-        return angle, (x1, y1), (x2, y2), "angle_radians"
+        value, p, q, angle_evidence = _angle_dimension_geometry(a, b)
+        return value, p, q, "angle_radians", angle_evidence
+    if kind in {"horizontal_distance", "vertical_distance"}:
+        value, p, q, axis_evidence = _axis_distance_geometry(kind, a, b)
+        return value, p, q, "length_mm", axis_evidence
     p, q = _point(a), _point(b)
-    if kind == "horizontal_distance":
-        value = abs(q[0] - p[0])
-    elif kind == "vertical_distance":
-        value = abs(q[1] - p[1])
-    else:
-        value = math.dist(p, q)
-    return value, p, q, "length_mm"
+    evidence = {
+        "strategy": "visual_feature_anchors",
+        "anchor1_view_mm": list(p),
+        "anchor2_view_mm": list(q),
+    }
+    return math.dist(p, q), p, q, "length_mm", evidence
 
 
 def _view_transform(view: Any) -> dict[str, float]:
@@ -554,25 +921,252 @@ def _view_to_sheet(x: float, y: float, tf: dict[str, float]) -> tuple[float, flo
     return sx, sy
 
 
+def _bbox_intersects(a: dict[str, float], b: dict[str, float], margin: float = 0.0) -> bool:
+    return not (
+        a["xmax"] + margin < b["xmin"]
+        or b["xmax"] + margin < a["xmin"]
+        or a["ymax"] + margin < b["ymin"]
+        or b["ymax"] + margin < a["ymin"]
+    )
+
+
+def _point_clearance_score(
+    point: tuple[float, float], obstacles: list[dict[str, float]], clearance: float
+) -> float:
+    score = 0.0
+    x, y = point
+    for box in obstacles:
+        if (box["xmin"] - clearance <= x <= box["xmax"] + clearance and
+                box["ymin"] - clearance <= y <= box["ymax"] + clearance):
+            score += 1000.0
+        cx = min(max(x, box["xmin"]), box["xmax"])
+        cy = min(max(y, box["ymin"]), box["ymax"])
+        d = math.hypot(x - cx, y - cy)
+        score += 1.0 / max(d, 0.25)
+    return score
+
+
+def _geometry_obstacles(view: Any, application: Any, exclude_indices: set[int] | None = None) -> list[dict[str, float]]:
+    excluded = exclude_indices or set()
+    boxes: list[dict[str, float]] = []
+    try:
+        elements = view.GeometricElements
+        count = int(elements.Count)
+    except Exception:
+        return boxes
+    for i in range(1, count + 1):
+        if i in excluded:
+            continue
+        try:
+            desc = _describe(application, elements.Item(i), i)
+            box = desc.get("range_box_view_mm")
+            if box:
+                boxes.append({k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")})
+        except Exception:
+            continue
+    return boxes
+
+
+def _existing_dimension_obstacles(application: Any, view: Any, exclude_index: Optional[int] = None) -> list[dict[str, float]]:
+    boxes: list[dict[str, float]] = []
+    try:
+        count = int(view.Dimensions.Count)
+    except Exception:
+        return boxes
+    for i in range(1, count + 1):
+        if exclude_index is not None and i == exclude_index:
+            continue
+        try:
+            box = _boundary(application, view.Dimensions.Item(i))
+            if box:
+                boxes.append({k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")})
+        except Exception:
+            continue
+    return boxes
+
+
+def _candidate_best(
+    candidates: list[tuple[float, float, str]],
+    obstacles: list[dict[str, float]],
+    clearance: float,
+) -> tuple[float, float, dict[str, Any]]:
+    if not candidates:
+        raise ValueError("no placement candidates were generated")
+    scored = []
+    for x, y, label in candidates:
+        score = _point_clearance_score((x, y), obstacles, clearance)
+        scored.append((score, x, y, label))
+    scored.sort(key=lambda row: row[0])
+    score, x, y, label = scored[0]
+    return x, y, {
+        "candidate_strategy": "minimum_obstacle_score",
+        "selected_candidate": label,
+        "selected_score": score,
+        "candidates": [
+            {"label": label_i, "view_mm": [x_i, y_i], "score": score_i}
+            for score_i, x_i, y_i, label_i in scored
+        ],
+    }
+
+
+def _semantic_candidates(
+    kind: str,
+    p: tuple[float, float],
+    q: tuple[float, float],
+    offset_view: float,
+    evidence: dict[str, Any],
+) -> list[tuple[float, float, str]]:
+    mx, my = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
+    gap = max(abs(offset_view), 4.0)
+    if kind == "line_to_line":
+        ux, uy = evidence.get("line_direction", [1.0, 0.0]) if evidence.get("line_direction") else (1.0, 0.0)
+        return [(mx, my, "between_common_span"), (mx + ux * gap, my + uy * gap, "between_shift_plus"), (mx - ux * gap, my - uy * gap, "between_shift_minus")]
+    if kind == "angle":
+        vertex = tuple(evidence.get("vertex_view_mm", [mx, my]))
+        bx, by = evidence.get("bisector", [1.0, 0.0])
+        radius = float(evidence.get("witness_radius_view_mm", max(math.dist(p, vertex), 8.0)))
+        base = radius + gap
+        return [
+            (vertex[0] + bx * base, vertex[1] + by * base, "inside_angle_bisector"),
+            (vertex[0] - bx * base, vertex[1] - by * base, "opposite_angle_sector"),
+            (vertex[0] + by * base, vertex[1] - bx * base, "rotated_sector_plus"),
+            (vertex[0] - by * base, vertex[1] + bx * base, "rotated_sector_minus"),
+        ]
+    if kind in {"radius", "diameter"}:
+        c = tuple(evidence.get("center_view_mm", [mx, my]))
+        r = float(evidence.get("radius_mm", max(math.dist(p, q), 1.0)))
+        d = r + gap
+        inv = 1.0 / math.sqrt(2.0)
+        dirs = [(1,0,"east"),(-1,0,"west"),(0,1,"north"),(0,-1,"south"),(inv,inv,"north_east"),(-inv,inv,"north_west"),(inv,-inv,"south_east"),(-inv,-inv,"south_west")]
+        return [(c[0] + dx*d, c[1] + dy*d, label) for dx,dy,label in dirs]
+    if kind == "horizontal_distance":
+        y_hi = max(p[1], q[1]) + gap
+        y_lo = min(p[1], q[1]) - gap
+        return [(mx, y_hi, "above_features"), (mx, y_lo, "below_features"), (mx, my, "between_features")]
+    if kind == "vertical_distance":
+        x_hi = max(p[0], q[0]) + gap
+        x_lo = min(p[0], q[0]) - gap
+        return [(x_hi, my, "right_of_features"), (x_lo, my, "left_of_features"), (mx, my, "between_features")]
+    if kind == "center_to_line":
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        norm = math.hypot(dx, dy)
+        if norm <= _EPS:
+            return [(mx + gap, my + gap, "fallback_diagonal")]
+        nx, ny = -dy/norm, dx/norm
+        return [(mx + nx*gap, my + ny*gap, "side_plus"), (mx - nx*gap, my - ny*gap, "side_minus"), (mx,my,"between_center_and_line")]
+    if kind in {"center_to_center", "distance", "aligned_distance", "line_length"}:
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        norm = math.hypot(dx, dy)
+        if norm <= _EPS:
+            return [(mx + gap, my + gap, "fallback_diagonal")]
+        nx, ny = -dy/norm, dx/norm
+        return [(mx + nx*gap, my + ny*gap, "normal_plus"), (mx - nx*gap, my - ny*gap, "normal_minus"), (mx,my,"between_features")]
+    return [(mx, my, "midpoint")]
+
 def _auto_position(
     kind: str,
     p: tuple[float, float],
     q: tuple[float, float],
     offset_sheet_mm: float,
     scale: float,
-) -> tuple[float, float]:
-    mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
-    offset = offset_sheet_mm / scale
-    if kind == "horizontal_distance":
-        return mx, max(p[1], q[1]) + offset
-    if kind == "vertical_distance":
-        return max(p[0], q[0]) + offset, my
-    dx, dy = q[0] - p[0], q[1] - p[1]
-    length = math.hypot(dx, dy)
-    if length <= _EPS:
-        return mx + offset, my + offset
-    nx, ny = -dy / length, dx / length
-    return mx + nx * offset, my + ny * offset
+    placement_mode: str = "smart",
+    line_direction: Optional[tuple[float, float]] = None,
+    anchor_evidence: Optional[dict[str, Any]] = None,
+    obstacles: Optional[list[dict[str, float]]] = None,
+) -> tuple[float, float, dict[str, Any]]:
+    """Choose a semantic drafting position and score alternatives against obstacles."""
+    mode = str(placement_mode or "smart").strip().lower().replace("-", "_")
+    if mode not in {"smart", "between", "outside"}:
+        raise ValueError("placement_mode must be 'smart', 'between', or 'outside'")
+    mx, my = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
+    offset = float(offset_sheet_mm) / float(scale)
+    evidence = dict(anchor_evidence or {})
+    if line_direction is not None:
+        evidence["line_direction"] = list(line_direction)
+    if mode == "between":
+        return mx, my, {
+            "strategy": "forced_between_feature_anchors",
+            "midpoint_view_mm": [mx, my],
+            "applied_offset_sheet_mm": 0.0,
+        }
+    obs = list(obstacles or [])
+    candidates = _semantic_candidates(kind, p, q, offset, evidence)
+    # outside mode removes explicit in-between choices when available.
+    if mode == "outside":
+        filtered = [c for c in candidates if "between" not in c[2]]
+        if filtered:
+            candidates = filtered
+    clearance = max(1.5, 2.0 / max(scale, _EPS))
+    vx, vy, scoring = _candidate_best(candidates, obs, clearance)
+    scoring.update({
+        "strategy": f"semantic_{kind}_placement",
+        "midpoint_view_mm": [mx, my],
+        "placement_mode": mode,
+        "obstacle_count": len(obs),
+        "clearance_view_mm": clearance,
+        "applied_offset_sheet_mm": offset_sheet_mm,
+    })
+    return vx, vy, scoring
+
+
+def _postplacement_collision_check(
+    application: Any,
+    view: Any,
+    dim: Any,
+    dimension_index: int,
+    geometry_obstacles: list[dict[str, float]],
+    margin: float = 0.5,
+) -> dict[str, Any]:
+    box = _boundary(application, dim)
+    if box is None:
+        return {"verified": False, "collision_free": None, "boundary": None, "collisions": []}
+    subject = {k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")}
+    existing = _existing_dimension_obstacles(application, view, exclude_index=dimension_index)
+    collisions = []
+    for label, obstacle_list in (("geometry", geometry_obstacles), ("dimension", existing)):
+        for i, obstacle in enumerate(obstacle_list):
+            if _bbox_intersects(subject, obstacle, margin=margin):
+                collisions.append({"type": label, "index": i, "bbox": obstacle})
+    return {
+        "verified": True,
+        "collision_free": not collisions,
+        "boundary": box,
+        "collision_margin_view_mm": margin,
+        "collisions": collisions,
+    }
+
+
+def _try_collision_reposition(
+    application: Any,
+    view: Any,
+    dim: Any,
+    dimension_index: int,
+    candidates: list[dict[str, Any]],
+    geometry_obstacles: list[dict[str, float]],
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    # Candidates are already score-ordered. Try the next positions if the initial
+    # CATIA boundary collides with other geometry or dimensions.
+    for candidate in candidates[1:6]:
+        point = candidate.get("view_mm")
+        if not isinstance(point, list) or len(point) != 2:
+            continue
+        try:
+            dim.MoveValue(float(point[0]), float(point[1]), 0, 0)
+            check = _postplacement_collision_check(
+                application, view, dim, dimension_index, geometry_obstacles
+            )
+            attempts.append({"candidate": candidate, "check": check, "error": None})
+            if check.get("collision_free") is True:
+                return {
+                    "repositioned": True,
+                    "selected_view_mm": [float(point[0]), float(point[1])],
+                    "attempts": attempts,
+                    "final_check": check,
+                }
+        except Exception as exc:
+            attempts.append({"candidate": candidate, "check": None, "error": _format_error(exc)})
+    return {"repositioned": False, "selected_view_mm": None, "attempts": attempts, "final_check": None}
 
 
 def _dimension_value(dim: Any) -> Optional[float]:
@@ -656,6 +1250,8 @@ def _add_internal(
     position_y: Optional[float],
     position_space: str,
     offset_mm: float,
+    placement_mode: str,
+    allow_view_bounds_fallback: bool,
     witness_points: Optional[list[float]],
     name: str,
     tolerance_upper: Optional[float],
@@ -680,10 +1276,13 @@ def _add_internal(
             obj2, idx2 = _geometry(view, element2)
             b = _describe(application, obj2, idx2)
         _validate_kind(kind, a, b)
-        expected, anchor1, anchor2, unit = _expected_and_anchors(kind, a, b)
+        expected, anchor1, anchor2, unit, anchor_evidence = _expected_and_anchors(kind, a, b)
         cat_obj1, cat_obj2 = _catia_geometry_objects(kind, obj1, obj2)
     except Exception as primary_exc:
-        if kind not in {"horizontal_distance", "vertical_distance"}:
+        if (
+            kind not in {"horizontal_distance", "vertical_distance"}
+            or not bool(allow_view_bounds_fallback)
+        ):
             raise
 
         expected, anchor1, anchor2, fallback_evidence = _view_bounds_dimension_anchors(
@@ -716,6 +1315,7 @@ def _add_internal(
             "direction": None,
         }
         unit = "length_mm"
+        anchor_evidence = {"strategy": "drawing_view_size_fallback"}
         cat_obj1 = None
         cat_obj2 = None
 
@@ -733,6 +1333,11 @@ def _add_internal(
         witnesses = [_finite(v, f"witness_points[{i}]") for i, v in enumerate(witness_points)]
 
     warnings: list[str] = []
+    # Snapshot obstacles before creating the new dimension. Geometry range boxes and
+    # existing dimension value boxes are used to score semantic placement candidates.
+    geometry_obstacles = _geometry_obstacles(view, application)
+    existing_dimension_obstacles = _existing_dimension_obstacles(application, view)
+    placement_obstacles = geometry_obstacles + existing_dimension_obstacles
 
     if fallback_mode:
         geometry_before = _safe_count(_safe_attr(view, "GeometricElements"))
@@ -821,9 +1426,23 @@ def _add_internal(
 
     tf = _view_transform(view)
     offset = _finite(offset_mm, "offset_mm")
+    placement_evidence: dict[str, Any]
     if position_x is None and position_y is None:
-        vx, vy = _auto_position(kind, anchor1, anchor2, offset, tf["scale"])
-        resolved_from = "drawing_view_size_fallback" if fallback_mode else "automatic_feature_offset"
+        line_direction = None
+        if kind == "line_to_line" and a is not None and a.get("direction"):
+            line_direction = tuple(float(v) for v in a["direction"])
+        vx, vy, placement_evidence = _auto_position(
+            kind, anchor1, anchor2, offset, tf["scale"],
+            placement_mode=placement_mode,
+            line_direction=line_direction,
+            anchor_evidence=anchor_evidence,
+            obstacles=placement_obstacles,
+        )
+        resolved_from = (
+            "drawing_view_size_fallback"
+            if fallback_mode
+            else placement_evidence["strategy"]
+        )
     elif position_x is None or position_y is None:
         view.Dimensions.Remove(created_index)
         if helper_points:
@@ -836,9 +1455,11 @@ def _add_internal(
         if space == "sheet":
             vx, vy = _sheet_to_view(px, py, tf)
             resolved_from = "sheet_coordinates_converted_to_view"
+            placement_evidence = {"strategy": resolved_from}
         elif space == "view":
             vx, vy = px, py
             resolved_from = "explicit_view_coordinates"
+            placement_evidence = {"strategy": resolved_from}
         else:
             view.Dimensions.Remove(created_index)
             if helper_points:
@@ -861,6 +1482,35 @@ def _add_internal(
             view.SaveEdition()
         except Exception:
             pass
+
+        # Verify the actual CATIA dimension boundary. If it still overlaps other
+        # geometry/dimensions, try the next semantic candidate positions.
+        collision_check = _postplacement_collision_check(
+            application, view, dim, created_index, geometry_obstacles
+        )
+        collision_reposition = {"repositioned": False, "attempts": [], "final_check": None}
+        if (
+            position_x is None
+            and position_y is None
+            and collision_check.get("collision_free") is False
+            and isinstance(placement_evidence.get("candidates"), list)
+        ):
+            collision_reposition = _try_collision_reposition(
+                application, view, dim, created_index,
+                placement_evidence["candidates"], geometry_obstacles
+            )
+            if collision_reposition.get("repositioned"):
+                vx, vy = collision_reposition["selected_view_mm"]
+                collision_check = collision_reposition["final_check"]
+                try:
+                    view.SaveEdition()
+                except Exception:
+                    pass
+            elif collision_check.get("collisions"):
+                warnings.append(
+                    "Semantic placement completed, but no tested candidate was fully "
+                    "collision-free against visible geometry/existing dimensions."
+                )
     except Exception as exc:
         cleanup_error = None
         try:
@@ -892,6 +1542,12 @@ def _add_internal(
     box = _boundary(application, dim)
     if box is None:
         warnings.append("CATIA did not return a verifiable dimension value boundary box")
+    if 'collision_check' not in locals():
+        collision_check = _postplacement_collision_check(
+            application, view, dim, created_index, geometry_obstacles
+        )
+    if 'collision_reposition' not in locals():
+        collision_reposition = {"repositioned": False, "attempts": [], "final_check": None}
     sx, sy = _view_to_sheet(vx, vy, tf)
     data = {
         "view": str(getattr(view, "Name", "")),
@@ -906,17 +1562,23 @@ def _add_internal(
         "support_mode": "drawing_view_size_hidden_helper_points" if fallback_mode else "original_drawing_geometry",
         "fallback_evidence": fallback_evidence,
         "expected_value": expected,
+        "anchor_strategy": anchor_evidence,
         "catia_measured_value": actual,
         "value_unit": unit,
         "value_matches_independent_calculation": value_matches,
         "witness_points_view_mm": witnesses,
         "placement": {
             "resolved_from": resolved_from,
+            "placement_mode": placement_mode,
+            "semantic_placement": placement_evidence,
             "view_mm": [vx, vy],
             "sheet_mm": [sx, sy],
             "view_transform": tf,
             "value_boundary_box_view_mm": box,
             "verified": box is not None,
+            "collision_check": collision_check,
+            "collision_reposition": collision_reposition,
+            "collision_free": collision_check.get("collision_free"),
         },
         "tolerance_set": tolerance_set,
         "dimension_count_before": before,
@@ -993,7 +1655,9 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         position_x: float | None = None,
         position_y: float | None = None,
         position_space: str = "view",
-        offset_mm: float = 15.0,
+        offset_mm: float = 0.0,
+        placement_mode: str = "smart",
+        allow_view_bounds_fallback: bool = False,
         witness_points: list[float] | None = None,
         name: str = "",
         tolerance_upper: float | None = None,
@@ -1006,13 +1670,14 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         aligned_distance/line_to_line/center_to_line/center_to_center/radius/
         diameter/angle/line_length. Coordinates are view-local by default.
         With position_space='sheet', coordinates are rigorously converted using
-        view origin, rotation and scale. If position is omitted, a feature-based
-        offset in paper millimetres is used.
+        view origin, rotation and scale. If position is omitted, semantic smart
+        placement is used. For line_to_line, the value is placed between the two
+        visible parallel lines, centred on their common visible span. offset_mm
+        then slides it only along the lines instead of pushing it out of the gap.
 
-        For horizontal_distance/vertical_distance, if the requested element
-        selectors cannot be resolved in the DrawingView, the tool falls back
-        to the verified DrawingView.Size bounding box and creates hidden helper
-        Point2D supports.
+        The old whole-view DrawingView.Size fallback is disabled by default.
+        Set allow_view_bounds_fallback=True only when the caller intentionally
+        wants the full visible view width/height rather than selected geometry.
         """
         try:
             application, document, sheet, view = _active_context(conn, view_name)
@@ -1021,6 +1686,8 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 kind=kind, element1=element1, element2=element2,
                 position_x=position_x, position_y=position_y,
                 position_space=position_space, offset_mm=offset_mm,
+                placement_mode=placement_mode,
+                allow_view_bounds_fallback=allow_view_bounds_fallback,
                 witness_points=witness_points, name=name,
                 tolerance_upper=tolerance_upper, tolerance_lower=tolerance_lower,
                 tolerance_display_mode=tolerance_display_mode,
@@ -1054,7 +1721,9 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                         element2=spec.get("element2"),
                         position_x=spec.get("position_x"), position_y=spec.get("position_y"),
                         position_space=spec.get("position_space", "view"),
-                        offset_mm=spec.get("offset_mm", 15.0),
+                        offset_mm=spec.get("offset_mm", 0.0),
+                        placement_mode=spec.get("placement_mode", "smart"),
+                        allow_view_bounds_fallback=spec.get("allow_view_bounds_fallback", False),
                         witness_points=spec.get("witness_points"), name=spec.get("name", ""),
                         tolerance_upper=spec.get("tolerance_upper"),
                         tolerance_lower=spec.get("tolerance_lower"),

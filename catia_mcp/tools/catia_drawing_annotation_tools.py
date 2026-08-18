@@ -3,6 +3,12 @@
 These tools target classic CATDrawing Automation.  ``catia_create_gdt_frame``
 creates a native two-dimensional ``DrawingGDT``; it is intentionally *not*
 reported as a semantic three-dimensional FT&A tolerance.
+
+Semantic projected-geometry dimensions are deliberately delegated to
+``catia_2d_dimensions.catia_add_2d_drawing_dimension`` / the registered
+``catia_add_2d_drawing_dimension`` tool.  The helper-point dimension below remains
+an explicit low-level escape hatch and must not be selected for normal projected
+line/circle/centre dimensions.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ from typing import Any, Optional, Sequence, Tuple
 from catia_mcp.connection import CATIAError
 
 
-IMPLEMENTATION_VERSION = "drawing-annotation-tools-fixed-2026-08-05-v7"
+IMPLEMENTATION_VERSION = "drawing-annotation-tools-fixed-2026-08-18-v8-semantic-dimension-delegation"
 _CATVB_SCRIPT_LANGUAGE = 1
 
 # Zero-based CATIA enum values.
@@ -1970,17 +1976,18 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
     names: list[str] = []
 
     @mcp.tool()
-    def catia_add_linear_dimension(
+    def catia_add_helper_point_linear_dimension(
         view_name: str,
         point1_coords: Tuple[float, float],
         point2_coords: Tuple[float, float],
     ) -> dict[str, Any]:
-        """Create a native point-supported distance dimension.
+        """Create a helper-point-supported distance dimension.
 
-        Coordinates are expressed in the target view coordinate system in
-        millimetres. The dimension is associated with two hidden helper
-        Point2D objects created by this tool; it is not associated with
-        projected model edges or circles.
+        IMPORTANT: this is intentionally NOT a semantic projected-geometry
+        dimension tool. Coordinates are expressed in the target view coordinate
+        system and two hidden Point2D supports are created. For dimensions
+        between real projected lines/circles/centres, use
+        catia_add_2d_drawing_dimension from catia_2d_dimensions instead.
         """
         support_points: list[Any] = []
         dimension = None
@@ -2189,7 +2196,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 )
             )
             return _error(
-                "catia_add_linear_dimension",
+                "catia_add_helper_point_linear_dimension",
                 exc,
                 data={
                     "dimension_cleanup": dimension_cleanup,
@@ -2206,7 +2213,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 status="error" if rollback_verified else "partial_success",
             )
 
-    names.append("catia_add_linear_dimension")
+    names.append("catia_add_helper_point_linear_dimension")
 
     @mcp.tool()
     def catia_create_dimension_tolerance(
