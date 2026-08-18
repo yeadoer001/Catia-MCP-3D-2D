@@ -1,6 +1,6 @@
 """
 drawing_template_tools.py
-Version: drawing-template-tools-fixed-2026-08-05-v7
+Version: drawing-template-tools-2026-08-18-v9-lowercase-placeholders
 
 Verified CATIA V5 title-block, projection-standard and drawing-frame tools.
 
@@ -139,7 +139,7 @@ def _evaluate(
 
 # v6: paste-first, non-destructive replacement with verified rollback paths.
 
-IMPLEMENTATION_VERSION = "drawing-template-tools-fixed-2026-08-05-v7"
+IMPLEMENTATION_VERSION = "drawing-template-tools-2026-08-18-v9-lowercase-placeholders"
 # CATScriptLanguage is zero based: CATVBScriptLanguage=0,
 # CATVBALanguage=1.  Evaluate executes inline VBScript, not a VBA project.
 _CATVB_SCRIPT_LANGUAGE = 0
@@ -182,7 +182,28 @@ TITLE_BLOCK_KEYS = [
     "Units", "Projection", "Sheet",
 ]
 
-DEFAULT_TEMPLATE_FILENAME = "TAISHAN_STANDARD_A3_LANDSCAPE.CATDrawing"
+# Template value placeholders are deliberately lowercase identifiers.  Fixed
+# labels such as CHECKED:, APPROVED:, DATE: and SCALE: must never be rewritten
+# by the placeholder-only API.
+LOWERCASE_TITLE_PLACEHOLDERS = {
+    "name_designed", "date_designed",
+    "name_checked", "date_checked",
+    "name_approved", "date_approved",
+    "product_description", "product_number",
+    "product_sheet", "product_rev", "product_scale",
+    "material", "weight",
+}
+
+
+def _is_lowercase_placeholder(value: str) -> bool:
+    text = str(value).strip()
+    return bool(
+        text
+        and text == text.lower()
+        and re.fullmatch(r"[a-z][a-z0-9_]*", text)
+    )
+
+DEFAULT_TEMPLATE_FILENAME = "TAISHAN_STANDARD_A0_LANDSCAPE.CATDrawing"
 DEFAULT_TEMPLATE_ENV = "CATIA_MCP_DRAWING_TEMPLATE"
 
 # ---------------------------------------------------------------------------
@@ -3915,6 +3936,904 @@ def create_drawing_from_template(
         raise
 
 
+
+# ---------------------------------------------------------------------------
+# Generic editable drawing text inventory and update (v8)
+# ---------------------------------------------------------------------------
+
+_TEXT_ITEM_ID_RE = re.compile(
+    r"^S(?P<sheet>\d+)/V(?P<view>\d+)/"
+    r"(?:(?:TEXT/(?P<text>\d+))|"
+    r"(?:TABLE/(?P<table>\d+)/R(?P<row>\d+)/C(?P<column>\d+)))$"
+)
+
+
+def _sheet_collection_index(drawing_doc: Any, sheet: Any) -> int:
+    sheets = drawing_doc.Sheets
+    for index in range(1, int(sheets.Count) + 1):
+        try:
+            if sheets.Item(index).Name == sheet.Name:
+                return index
+        except Exception:
+            continue
+    raise RuntimeError("The active DrawingSheet index could not be resolved.")
+
+
+def _drawing_text_item_id(
+    sheet_index: int,
+    view_index: int,
+    text_index: int,
+) -> str:
+    return f"S{sheet_index}/V{view_index}/TEXT/{text_index}"
+
+
+def _drawing_table_item_id(
+    sheet_index: int,
+    view_index: int,
+    table_index: int,
+    row: int,
+    column: int,
+) -> str:
+    return (
+        f"S{sheet_index}/V{view_index}/TABLE/{table_index}"
+        f"/R{row}/C{column}"
+    )
+
+
+def _parse_text_item_id(item_id: str) -> Dict[str, Any]:
+    raw = str(item_id or "").strip()
+    match = _TEXT_ITEM_ID_RE.fullmatch(raw)
+    if match is None:
+        raise ValueError(
+            "item_id must use one of these formats: "
+            "S<sheet>/V<view>/TEXT/<index> or "
+            "S<sheet>/V<view>/TABLE/<table>/R<row>/C<column>."
+        )
+    values = {
+        key: int(value) if value is not None else None
+        for key, value in match.groupdict().items()
+    }
+    values["item_id"] = raw
+    values["kind"] = (
+        "DrawingText"
+        if values["text"] is not None
+        else "DrawingTableCell"
+    )
+    return values
+
+
+def _view_inventory_for_text_edit(
+    drawing_doc: Any,
+    sheet: Any,
+    sheet_index: int,
+    *,
+    include_all_views: bool,
+    include_empty: bool,
+    include_drawing_texts: bool,
+    include_table_cells: bool,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    items: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    views = sheet.Views
+    view_indices = (
+        range(1, int(views.Count) + 1)
+        if include_all_views else
+        [2]
+    )
+
+    for view_index in view_indices:
+        try:
+            view = views.Item(view_index)
+            view_name = str(_safe_attr(view, "Name", ""))
+            view_type = _safe_attr(view, "ViewType", None)
+            is_system_view = view_index <= 2
+        except Exception as exc:
+            warnings.append(
+                f"View index {view_index} could not be read: "
+                f"{_format_com_error(exc)}"
+            )
+            continue
+
+        if include_drawing_texts:
+            texts = _safe_attr(view, "Texts", None)
+            text_count = _safe_count(texts) or 0
+            for text_index in range(1, text_count + 1):
+                try:
+                    obj = texts.Item(text_index)
+                    content = str(obj.Text)
+                    if not include_empty and not content.strip():
+                        continue
+                    x = _safe_attr(obj, "x", None)
+                    y = _safe_attr(obj, "y", None)
+                    linked = _safe_attr(obj, "NbLink", None)
+                    items.append({
+                        "item_id": _drawing_text_item_id(
+                            sheet_index,
+                            view_index,
+                            text_index,
+                        ),
+                        "kind": "DrawingText",
+                        "sheet_index": sheet_index,
+                        "sheet_name": str(sheet.Name),
+                        "view_index": view_index,
+                        "view_name": view_name,
+                        "view_type_code": (
+                            int(view_type)
+                            if view_type is not None else None
+                        ),
+                        "is_system_view": is_system_view,
+                        "text_index": text_index,
+                        "object_name": str(
+                            _safe_attr(obj, "Name", "")
+                        ),
+                        "text": content,
+                        "is_empty": not bool(content.strip()),
+                        "x_mm": (
+                            float(x) * 1000.0
+                            if x is not None else None
+                        ),
+                        "y_mm": (
+                            float(y) * 1000.0
+                            if y is not None else None
+                        ),
+                        "linked_parameter_count": (
+                            int(linked)
+                            if linked is not None else None
+                        ),
+                        "may_be_parameter_linked": bool(
+                            linked is not None and int(linked) > 0
+                        ),
+                        "editable_api": "DrawingText.Text",
+                    })
+                except Exception as exc:
+                    warnings.append(
+                        f"View {view_index} DrawingText {text_index} "
+                        f"could not be read: {_format_com_error(exc)}"
+                    )
+
+        if include_table_cells:
+            tables = _safe_attr(view, "Tables", None)
+            table_count = _safe_count(tables) or 0
+            for table_index in range(1, table_count + 1):
+                try:
+                    table = tables.Item(table_index)
+                    rows = int(
+                        _safe_attr(table, "NumberOfRows", 0) or 0
+                    )
+                    columns = int(
+                        _safe_attr(table, "NumberOfColumns", 0) or 0
+                    )
+                    table_name = str(
+                        _safe_attr(table, "Name", "")
+                    )
+                except Exception as exc:
+                    warnings.append(
+                        f"View {view_index} DrawingTable {table_index} "
+                        f"metadata could not be read: "
+                        f"{_format_com_error(exc)}"
+                    )
+                    continue
+                for row in range(1, rows + 1):
+                    for column in range(1, columns + 1):
+                        try:
+                            content = _table_cell_text(
+                                table,
+                                row,
+                                column,
+                            )
+                            if (
+                                not include_empty
+                                and not content.strip()
+                            ):
+                                continue
+                            items.append({
+                                "item_id": _drawing_table_item_id(
+                                    sheet_index,
+                                    view_index,
+                                    table_index,
+                                    row,
+                                    column,
+                                ),
+                                "kind": "DrawingTableCell",
+                                "sheet_index": sheet_index,
+                                "sheet_name": str(sheet.Name),
+                                "view_index": view_index,
+                                "view_name": view_name,
+                                "view_type_code": (
+                                    int(view_type)
+                                    if view_type is not None else None
+                                ),
+                                "is_system_view": is_system_view,
+                                "table_index": table_index,
+                                "table_name": table_name,
+                                "row": row,
+                                "column": column,
+                                "text": content,
+                                "is_empty": not bool(
+                                    content.strip()
+                                ),
+                                "editable_api": (
+                                    "DrawingTable.SetCellString"
+                                ),
+                            })
+                        except Exception as exc:
+                            warnings.append(
+                                f"View {view_index} DrawingTable "
+                                f"{table_index} cell ({row},{column}) "
+                                f"could not be read: "
+                                f"{_format_com_error(exc)}"
+                            )
+    return items, warnings
+
+
+def list_drawing_text_items(
+    catia_app: Any,
+    sheet_index: Optional[int] = None,
+    include_all_views: bool = True,
+    include_empty: bool = False,
+    include_drawing_texts: bool = True,
+    include_table_cells: bool = True,
+) -> Dict[str, Any]:
+    """List every editable DrawingText and DrawingTable cell with stable IDs."""
+    for value, name in (
+        (include_all_views, "include_all_views"),
+        (include_empty, "include_empty"),
+        (include_drawing_texts, "include_drawing_texts"),
+        (include_table_cells, "include_table_cells"),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean.")
+    if not include_drawing_texts and not include_table_cells:
+        raise ValueError(
+            "At least one of include_drawing_texts or "
+            "include_table_cells must be true."
+        )
+
+    doc = _get_drawing_document(catia_app)
+    sheet, sheet_info = _resolve_sheet(doc, sheet_index)
+    resolved_sheet_index = (
+        sheet_info["sheet_index"]
+        or _sheet_collection_index(doc, sheet)
+    )
+    items, warnings = _view_inventory_for_text_edit(
+        doc,
+        sheet,
+        resolved_sheet_index,
+        include_all_views=include_all_views,
+        include_empty=include_empty,
+        include_drawing_texts=include_drawing_texts,
+        include_table_cells=include_table_cells,
+    )
+    kind_counts = {
+        "DrawingText": sum(
+            1 for item in items
+            if item["kind"] == "DrawingText"
+        ),
+        "DrawingTableCell": sum(
+            1 for item in items
+            if item["kind"] == "DrawingTableCell"
+        ),
+    }
+    return _success({
+        "operation": "list_drawing_text_items",
+        "sheet": {
+            **sheet_info,
+            "resolved_sheet_index": resolved_sheet_index,
+        },
+        "options": {
+            "include_all_views": include_all_views,
+            "include_empty": include_empty,
+            "include_drawing_texts": include_drawing_texts,
+            "include_table_cells": include_table_cells,
+        },
+        "item_count": len(items),
+        "kind_counts": kind_counts,
+        "items": items,
+        "item_id_stability": (
+            "Stable while the sheet/view/text/table collection "
+            "structure is unchanged."
+        ),
+        "model_modified": False,
+        "document_save_required": False,
+        "document_saved": _document_saved(doc),
+    }, warnings)
+
+
+def _resolve_text_item(
+    drawing_doc: Any,
+    parsed: Dict[str, Any],
+) -> Dict[str, Any]:
+    sheets = drawing_doc.Sheets
+    sheet_index = parsed["sheet"]
+    if sheet_index < 1 or sheet_index > int(sheets.Count):
+        raise IndexError(
+            f"item_id sheet index {sheet_index} is outside "
+            f"1..{int(sheets.Count)}."
+        )
+    sheet = sheets.Item(sheet_index)
+    views = sheet.Views
+    view_index = parsed["view"]
+    if view_index < 1 or view_index > int(views.Count):
+        raise IndexError(
+            f"item_id view index {view_index} is outside "
+            f"1..{int(views.Count)}."
+        )
+    view = views.Item(view_index)
+
+    if parsed["kind"] == "DrawingText":
+        texts = view.Texts
+        index = parsed["text"]
+        if index < 1 or index > int(texts.Count):
+            raise IndexError(
+                f"item_id DrawingText index {index} is outside "
+                f"1..{int(texts.Count)}."
+            )
+        obj = texts.Item(index)
+        return {
+            "kind": "DrawingText",
+            "sheet": sheet,
+            "view": view,
+            "object": obj,
+            "old_text": str(obj.Text),
+        }
+
+    tables = view.Tables
+    table_index = parsed["table"]
+    if table_index < 1 or table_index > int(tables.Count):
+        raise IndexError(
+            f"item_id DrawingTable index {table_index} is outside "
+            f"1..{int(tables.Count)}."
+        )
+    table = tables.Item(table_index)
+    rows = int(_safe_attr(table, "NumberOfRows", 0) or 0)
+    columns = int(
+        _safe_attr(table, "NumberOfColumns", 0) or 0
+    )
+    row = parsed["row"]
+    column = parsed["column"]
+    if row < 1 or row > rows or column < 1 or column > columns:
+        raise IndexError(
+            f"item_id table cell ({row},{column}) is outside "
+            f"rows 1..{rows}, columns 1..{columns}."
+        )
+    return {
+        "kind": "DrawingTableCell",
+        "sheet": sheet,
+        "view": view,
+        "table": table,
+        "row": row,
+        "column": column,
+        "old_text": _table_cell_text(table, row, column),
+    }
+
+
+def _set_drawing_text_verified(
+    catia_app: Any,
+    obj: Any,
+    requested_text: str,
+) -> Dict[str, Any]:
+    old_text = str(obj.Text)
+    attempts: List[Dict[str, Any]] = []
+    try:
+        obj.Text = str(requested_text)
+        actual = str(obj.Text)
+        verified = actual == str(requested_text)
+        attempts.append({
+            "method": "DrawingText.Text",
+            "succeeded": True,
+            "actual_text": actual,
+            "verified": verified,
+            "error": None,
+        })
+        if verified:
+            return {
+                "old_text": old_text,
+                "requested_text": str(requested_text),
+                "actual_text": actual,
+                "verified": True,
+                "selected_method": attempts[-1]["method"],
+                "attempts": attempts,
+                "error": None,
+            }
+    except Exception as exc:
+        attempts.append({
+            "method": "DrawingText.Text",
+            "succeeded": False,
+            "actual_text": old_text,
+            "verified": False,
+            "error": _format_com_error(exc),
+        })
+
+    script = (
+        "Public Function MCP_SetDrawingText(textObject, newText)\n"
+        " textObject.Text = CStr(newText)\n"
+        " MCP_SetDrawingText = CStr(textObject.Text)\n"
+        "End Function"
+    )
+    try:
+        actual = str(
+            _evaluate(
+                catia_app,
+                script,
+                "MCP_SetDrawingText",
+                [obj, str(requested_text)],
+            )
+        )
+        verified = actual == str(requested_text)
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate.DrawingText.Text"
+            ),
+            "succeeded": True,
+            "actual_text": actual,
+            "verified": verified,
+            "error": None,
+        })
+    except Exception as exc:
+        actual = str(obj.Text)
+        verified = False
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate.DrawingText.Text"
+            ),
+            "succeeded": False,
+            "actual_text": actual,
+            "verified": False,
+            "error": _format_com_error(exc),
+        })
+
+    selected = next(
+        (
+            item["method"]
+            for item in reversed(attempts)
+            if item["succeeded"]
+        ),
+        None,
+    )
+    return {
+        "old_text": old_text,
+        "requested_text": str(requested_text),
+        "actual_text": actual,
+        "verified": verified,
+        "selected_method": selected,
+        "attempts": attempts,
+        "error": None if verified else (
+            attempts[-1].get("error")
+            or "DrawingText readback did not match."
+        ),
+    }
+
+
+def _set_table_cell_verified_v8(
+    catia_app: Any,
+    table: Any,
+    row: int,
+    column: int,
+    requested_text: str,
+) -> Dict[str, Any]:
+    old_text = _table_cell_text(table, row, column)
+    attempts: List[Dict[str, Any]] = []
+    direct = _set_table_cell_verified(
+        table,
+        row,
+        column,
+        requested_text,
+    )
+    attempts.append({
+        "method": "DrawingTable.SetCellString",
+        "succeeded": direct["error"] is None,
+        "actual_text": direct["actual_text"],
+        "verified": direct["verified"],
+        "error": direct["error"],
+    })
+    if direct["verified"]:
+        return {
+            **direct,
+            "selected_method": attempts[-1]["method"],
+            "attempts": attempts,
+        }
+
+    script = (
+        "Public Function MCP_SetTableCell("
+        "tableObject, rowIndex, columnIndex, newText)\n"
+        " tableObject.SetCellString CLng(rowIndex), "
+        "CLng(columnIndex), CStr(newText)\n"
+        " MCP_SetTableCell = CStr(tableObject.GetCellString("
+        "CLng(rowIndex), CLng(columnIndex)))\n"
+        "End Function"
+    )
+    try:
+        actual = str(
+            _evaluate(
+                catia_app,
+                script,
+                "MCP_SetTableCell",
+                [
+                    table,
+                    int(row),
+                    int(column),
+                    str(requested_text),
+                ],
+            )
+        )
+        verified = actual == str(requested_text)
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                "DrawingTable.SetCellString"
+            ),
+            "succeeded": True,
+            "actual_text": actual,
+            "verified": verified,
+            "error": None,
+        })
+    except Exception as exc:
+        actual = _table_cell_text(table, row, column)
+        verified = False
+        attempts.append({
+            "method": (
+                "SystemService.Evaluate."
+                "DrawingTable.SetCellString"
+            ),
+            "succeeded": False,
+            "actual_text": actual,
+            "verified": False,
+            "error": _format_com_error(exc),
+        })
+    return {
+        "old_text": old_text,
+        "requested_text": str(requested_text),
+        "actual_text": actual,
+        "verified": verified,
+        "selected_method": next(
+            (
+                item["method"]
+                for item in reversed(attempts)
+                if item["succeeded"]
+            ),
+            None,
+        ),
+        "attempts": attempts,
+        "error": None if verified else (
+            attempts[-1].get("error")
+            or "DrawingTable cell readback did not match."
+        ),
+    }
+
+
+def _apply_text_item_update(
+    catia_app: Any,
+    resolved: Dict[str, Any],
+    requested_text: str,
+) -> Dict[str, Any]:
+    if resolved["kind"] == "DrawingText":
+        return _set_drawing_text_verified(
+            catia_app,
+            resolved["object"],
+            requested_text,
+        )
+    return _set_table_cell_verified_v8(
+        catia_app,
+        resolved["table"],
+        resolved["row"],
+        resolved["column"],
+        requested_text,
+    )
+
+
+def set_drawing_text_items(
+    catia_app: Any,
+    updates: List[Dict[str, Any]],
+    atomic: bool = True,
+    strict_readback: bool = True,
+    save_after_update: bool = False,
+) -> Dict[str, Any]:
+    """Update arbitrary DrawingText/table cells by stable item_id."""
+    if not isinstance(updates, list) or not updates:
+        raise ValueError("updates must be a non-empty list.")
+    for value, name in (
+        (atomic, "atomic"),
+        (strict_readback, "strict_readback"),
+        (save_after_update, "save_after_update"),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean.")
+
+    doc = _get_drawing_document(catia_app)
+    saved_before = _document_saved(doc)
+    parsed_updates: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    # Complete preflight before any mutation.
+    for index, update in enumerate(updates):
+        if not isinstance(update, dict):
+            raise ValueError(
+                f"updates[{index}] must be an object."
+            )
+        if "item_id" not in update or "text" not in update:
+            raise ValueError(
+                f"updates[{index}] requires item_id and text."
+            )
+        parsed = _parse_text_item_id(update["item_id"])
+        if parsed["item_id"] in seen_ids:
+            raise ValueError(
+                f"Duplicate item_id: {parsed['item_id']}."
+            )
+        seen_ids.add(parsed["item_id"])
+        resolved = _resolve_text_item(doc, parsed)
+        expected = update.get("expected_old_text", None)
+        if (
+            expected is not None
+            and str(expected) != resolved["old_text"]
+        ):
+            return _error(
+                "expected_old_text preflight mismatch. "
+                "No drawing text was modified.",
+                data={
+                    "operation": "set_drawing_text_items",
+                    "failed_update_index": index,
+                    "item_id": parsed["item_id"],
+                    "expected_old_text": str(expected),
+                    "actual_old_text": resolved["old_text"],
+                    "preflight_verified": False,
+                    "model_modified": False,
+                    "document_save_required": False,
+                },
+            )
+        parsed_updates.append({
+            "index": index,
+            "parsed": parsed,
+            "resolved": resolved,
+            "requested_text": str(update["text"]),
+            "expected_old_text": (
+                str(expected) if expected is not None else None
+            ),
+        })
+
+    results: List[Dict[str, Any]] = []
+    undo: List[Dict[str, Any]] = []
+    failed = False
+    failure_index = None
+
+    for item in parsed_updates:
+        result = _apply_text_item_update(
+            catia_app,
+            item["resolved"],
+            item["requested_text"],
+        )
+        verified = bool(result["verified"])
+        if verified:
+            undo.append({
+                "item_id": item["parsed"]["item_id"],
+                "resolved": item["resolved"],
+                "old_text": item["resolved"]["old_text"],
+            })
+        results.append({
+            "update_index": item["index"],
+            "item_id": item["parsed"]["item_id"],
+            "kind": item["parsed"]["kind"],
+            **result,
+        })
+        if strict_readback and not verified:
+            failed = True
+            failure_index = item["index"]
+            break
+
+    rollback_results: List[Dict[str, Any]] = []
+    if failed and atomic:
+        for item in reversed(undo):
+            restore = _apply_text_item_update(
+                catia_app,
+                item["resolved"],
+                item["old_text"],
+            )
+            rollback_results.append({
+                "item_id": item["item_id"],
+                "verified": bool(restore["verified"]),
+                "result": restore,
+            })
+
+    affected_sheets = sorted({
+        item["parsed"]["sheet"] for item in parsed_updates
+    })
+    update_attempts: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for sheet_index in affected_sheets:
+        sheet = doc.Sheets.Item(sheet_index)
+        attempts, update_warnings = _update_drawing(
+            doc,
+            sheet,
+        )
+        update_attempts.append({
+            "sheet_index": sheet_index,
+            "attempts": attempts,
+        })
+        warnings.extend(update_warnings)
+
+    rollback_verified = bool(
+        failed
+        and atomic
+        and all(
+            item["verified"] for item in rollback_results
+        )
+        and len(rollback_results) == len(undo)
+    ) if failed and atomic else False
+
+    modified = bool(undo)
+    if failed and atomic and rollback_verified:
+        modified = False
+
+    save_result = {
+        "requested": save_after_update,
+        "attempted": False,
+        "succeeded": None,
+        "error": None,
+        "document_saved": _document_saved(doc),
+    }
+    if not failed and save_after_update:
+        save_result["attempted"] = True
+        try:
+            doc.Save()
+            save_result["succeeded"] = (
+                _document_saved(doc) is True
+            )
+            save_result["document_saved"] = _document_saved(doc)
+            if not save_result["succeeded"]:
+                raise RuntimeError(
+                    "DrawingDocument.Save returned without Saved=true."
+                )
+        except Exception as exc:
+            save_result["succeeded"] = False
+            save_result["error"] = _format_com_error(exc)
+            failed = True
+            failure_index = "save_after_update"
+
+    data = {
+        "operation": "set_drawing_text_items",
+        "requested_update_count": len(updates),
+        "applied_result_count": len(results),
+        "results": results,
+        "failure_index": failure_index,
+        "transaction": {
+            "atomic": atomic,
+            "strict_readback": strict_readback,
+            "failed": failed,
+            "undo_item_count": len(undo),
+            "rollback_attempted": bool(
+                failed and atomic and undo
+            ),
+            "rollback_results": rollback_results,
+            "rollback_verified": rollback_verified,
+        },
+        "update_attempts": update_attempts,
+        "save_result": save_result,
+        "model_modified": modified,
+        "document_save_required": (
+            modified and not bool(save_result["succeeded"])
+        ),
+        "document_saved_before": saved_before,
+        "document_saved_after": _document_saved(doc),
+        "preflight_verified": True,
+    }
+
+    if failed:
+        return _error(
+            "One or more drawing text updates failed verified "
+            "readback. Earlier updates were rolled back where "
+            "possible.",
+            data=data,
+            warnings=warnings,
+            status=(
+                "error"
+                if not modified else "partial_success"
+            ),
+        )
+    return _success(data, warnings)
+
+
+def set_lowercase_title_placeholders(
+    catia_app: Any,
+    values: Dict[str, str],
+    sheet_index: Optional[int] = None,
+    atomic: bool = True,
+    strict_readback: bool = True,
+    save_after_update: bool = False,
+) -> Dict[str, Any]:
+    """Replace exact lowercase template placeholders and nothing else.
+
+    The preflight inventories the Background View and requires each requested
+    key to match exactly one DrawingText or DrawingTable cell whose complete
+    current content is the lowercase placeholder.  Uppercase/fixed labels are
+    categorically excluded, even when they resemble a canonical title field.
+    """
+    if not isinstance(values, dict) or not values:
+        raise ValueError("values must be a non-empty object.")
+    requested: Dict[str, str] = {}
+    invalid: List[str] = []
+    for raw_key, raw_value in values.items():
+        key = str(raw_key).strip()
+        if not _is_lowercase_placeholder(key):
+            invalid.append(key)
+        else:
+            requested[key] = str(raw_value)
+    if invalid:
+        raise ValueError(
+            "Only exact lowercase placeholder identifiers are allowed: "
+            + ", ".join(invalid)
+        )
+
+    doc = _get_drawing_document(catia_app)
+    sheet, sheet_info = _resolve_sheet(doc, sheet_index)
+    resolved_sheet_index = (
+        sheet_info["sheet_index"] or _sheet_collection_index(doc, sheet)
+    )
+    items, warnings = _view_inventory_for_text_edit(
+        doc,
+        sheet,
+        resolved_sheet_index,
+        include_all_views=False,
+        include_empty=False,
+        include_drawing_texts=True,
+        include_table_cells=True,
+    )
+    matches: Dict[str, List[Dict[str, Any]]] = {
+        key: [] for key in requested
+    }
+    protected_fixed_labels: List[Dict[str, Any]] = []
+    for item in items:
+        content = str(item.get("text", "")).strip()
+        if content in matches and _is_lowercase_placeholder(content):
+            matches[content].append(item)
+        elif content and content.upper() == content and not _is_lowercase_placeholder(content):
+            protected_fixed_labels.append({
+                "item_id": item["item_id"],
+                "text": content,
+            })
+
+    missing = [key for key, found in matches.items() if not found]
+    ambiguous = {
+        key: len(found) for key, found in matches.items() if len(found) > 1
+    }
+    if missing or ambiguous:
+        return _error(
+            "Lowercase title-placeholder preflight failed; no title text was modified.",
+            data={
+                "operation": "set_lowercase_title_placeholders",
+                "requested": requested,
+                "missing_placeholders": missing,
+                "ambiguous_placeholders": ambiguous,
+                "protected_fixed_label_count": len(protected_fixed_labels),
+                "model_modified": False,
+                "document_save_required": False,
+            },
+            warnings=warnings,
+        )
+
+    updates = [
+        {
+            "item_id": matches[key][0]["item_id"],
+            "expected_old_text": key,
+            "text": value,
+        }
+        for key, value in requested.items()
+    ]
+    result = set_drawing_text_items(
+        catia_app,
+        updates=updates,
+        atomic=atomic,
+        strict_readback=strict_readback,
+        save_after_update=save_after_update,
+    )
+    data = result.get("data")
+    if isinstance(data, dict):
+        data["operation"] = "set_lowercase_title_placeholders"
+        data["requested_placeholders"] = requested
+        data["placeholder_policy"] = "exact_lowercase_complete_cell_match_only"
+        data["protected_fixed_label_count"] = len(protected_fixed_labels)
+    return result
+
+
+
 # ---------------------------------------------------------------------------
 # Registry Entry Point (Required by registry.py)
 # ---------------------------------------------------------------------------
@@ -3933,6 +4852,9 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         "audit_drawing_template": globals()["audit_drawing_template"],
         "create_clean_drawing_template": globals()["create_clean_drawing_template"],
         "create_drawing_from_template": globals()["create_drawing_from_template"],
+        "list_drawing_text_items": globals()["list_drawing_text_items"],
+        "set_drawing_text_items": globals()["set_drawing_text_items"],
+        "set_lowercase_title_placeholders": globals()["set_lowercase_title_placeholders"],
     }
 
     def _call(name: str, **kwargs: Any) -> Dict[str, Any]:
@@ -4032,6 +4954,68 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         )
 
     names.append("audit_drawing_template")
+
+    @mcp.tool()
+    def list_drawing_text_items(
+        sheet_index: Optional[int] = None,
+        include_all_views: bool = True,
+        include_empty: bool = False,
+        include_drawing_texts: bool = True,
+        include_table_cells: bool = True,
+    ) -> Dict[str, Any]:
+        """List every editable DrawingText and DrawingTable cell by item_id."""
+        return _call(
+            "list_drawing_text_items",
+            sheet_index=sheet_index,
+            include_all_views=include_all_views,
+            include_empty=include_empty,
+            include_drawing_texts=include_drawing_texts,
+            include_table_cells=include_table_cells,
+        )
+
+    names.append("list_drawing_text_items")
+
+    @mcp.tool()
+    def set_drawing_text_items(
+        updates: List[Dict[str, Any]],
+        atomic: bool = True,
+        strict_readback: bool = True,
+        save_after_update: bool = False,
+    ) -> Dict[str, Any]:
+        """Update arbitrary template text/table cells by stable item_id."""
+        return _call(
+            "set_drawing_text_items",
+            updates=updates,
+            atomic=atomic,
+            strict_readback=strict_readback,
+            save_after_update=save_after_update,
+        )
+
+    names.append("set_drawing_text_items")
+
+    @mcp.tool()
+    def set_lowercase_title_placeholders(
+        values: Dict[str, str],
+        sheet_index: Optional[int] = None,
+        atomic: bool = True,
+        strict_readback: bool = True,
+        save_after_update: bool = False,
+    ) -> Dict[str, Any]:
+        """Replace exact lowercase title-block placeholders only.
+
+        Fixed uppercase labels such as CHECKED:, APPROVED:, DATE: and SCALE:
+        are protected and cannot be selected by this tool.
+        """
+        return _call(
+            "set_lowercase_title_placeholders",
+            values=values,
+            sheet_index=sheet_index,
+            atomic=atomic,
+            strict_readback=strict_readback,
+            save_after_update=save_after_update,
+        )
+
+    names.append("set_lowercase_title_placeholders")
 
     @mcp.tool()
     def create_clean_drawing_template(

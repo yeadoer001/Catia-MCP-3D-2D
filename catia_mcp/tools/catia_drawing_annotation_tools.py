@@ -3,12 +3,6 @@
 These tools target classic CATDrawing Automation.  ``catia_create_gdt_frame``
 creates a native two-dimensional ``DrawingGDT``; it is intentionally *not*
 reported as a semantic three-dimensional FT&A tolerance.
-
-Semantic projected-geometry dimensions are deliberately delegated to
-``catia_2d_dimensions.catia_add_2d_drawing_dimension`` / the registered
-``catia_add_2d_drawing_dimension`` tool.  The helper-point dimension below remains
-an explicit low-level escape hatch and must not be selected for normal projected
-line/circle/centre dimensions.
 """
 
 from __future__ import annotations
@@ -21,7 +15,7 @@ from typing import Any, Optional, Sequence, Tuple
 from catia_mcp.connection import CATIAError
 
 
-IMPLEMENTATION_VERSION = "drawing-annotation-tools-fixed-2026-08-18-v8-semantic-dimension-delegation"
+IMPLEMENTATION_VERSION = "drawing-annotation-tools-2026-08-18-v8-contour-attached-gdt"
 _CATVB_SCRIPT_LANGUAGE = 1
 
 # Zero-based CATIA enum values.
@@ -1976,18 +1970,17 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
     names: list[str] = []
 
     @mcp.tool()
-    def catia_add_helper_point_linear_dimension(
+    def catia_add_linear_dimension(
         view_name: str,
         point1_coords: Tuple[float, float],
         point2_coords: Tuple[float, float],
     ) -> dict[str, Any]:
-        """Create a helper-point-supported distance dimension.
+        """Create a native point-supported distance dimension.
 
-        IMPORTANT: this is intentionally NOT a semantic projected-geometry
-        dimension tool. Coordinates are expressed in the target view coordinate
-        system and two hidden Point2D supports are created. For dimensions
-        between real projected lines/circles/centres, use
-        catia_add_2d_drawing_dimension from catia_2d_dimensions instead.
+        Coordinates are expressed in the target view coordinate system in
+        millimetres. The dimension is associated with two hidden helper
+        Point2D objects created by this tool; it is not associated with
+        projected model edges or circles.
         """
         support_points: list[Any] = []
         dimension = None
@@ -2196,7 +2189,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 )
             )
             return _error(
-                "catia_add_helper_point_linear_dimension",
+                "catia_add_linear_dimension",
                 exc,
                 data={
                     "dimension_cleanup": dimension_cleanup,
@@ -2213,7 +2206,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 status="error" if rollback_verified else "partial_success",
             )
 
-    names.append("catia_add_helper_point_linear_dimension")
+    names.append("catia_add_linear_dimension")
 
     @mcp.tool()
     def catia_create_dimension_tolerance(
@@ -3458,6 +3451,8 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
             position_xy: Tuple[float, float] = (50.0, 50.0),
             leader_xy: Optional[Tuple[float, float]] = None,
             attach_element: Optional[str] = None,
+            require_geometry_attachment: bool = True,
+            attachment_tolerance_mm: float = 0.25,
     ) -> dict[str, Any]:
 
         gdt = None
@@ -3499,8 +3494,72 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
 
             return None
 
+        def _catia_type_name(obj: Any) -> str:
+            if obj is None:
+                return ""
+            script = r'''
+Public Function MCP_AnnotationTypeName(target)
+    MCP_AnnotationTypeName = CStr(TypeName(target))
+End Function
+'''
+            try:
+                application, _ = _catia_application(ctx)
+                return str(_evaluate(
+                    application,
+                    script,
+                    "MCP_AnnotationTypeName",
+                    [obj],
+                )).strip()
+            except Exception:
+                return type(obj).__name__
+
+        def _catia_geometry_descriptor(obj: Any) -> dict[str, Any]:
+            script = r'''
+Public Function MCP_AnnotationGeometryDescriptor(target)
+    Dim p(1), c(1), o(1), d(1), b(3), radiusValue
+    Dim hasPoint, hasCenter, hasLine, hasRange, hasRadius
+    hasPoint = False: hasCenter = False: hasLine = False
+    hasRange = False: hasRadius = False: radiusValue = 0#
+    On Error Resume Next
+    Err.Clear: target.GetCoordinates p: hasPoint = (Err.Number = 0)
+    Err.Clear: target.GetCenter c: hasCenter = (Err.Number = 0)
+    Err.Clear: target.GetOrigin o: target.GetDirection d: hasLine = (Err.Number = 0)
+    Err.Clear: target.GetRangeBox b: hasRange = (Err.Number = 0)
+    Err.Clear: radiusValue = CDbl(target.Radius): hasRadius = (Err.Number = 0)
+    Err.Clear: On Error GoTo 0
+    MCP_AnnotationGeometryDescriptor = Array( _
+        CStr(TypeName(target)), CBool(hasPoint), CDbl(p(0)), CDbl(p(1)), _
+        CBool(hasCenter), CDbl(c(0)), CDbl(c(1)), _
+        CBool(hasLine), CDbl(o(0)), CDbl(o(1)), CDbl(d(0)), CDbl(d(1)), _
+        CBool(hasRange), CDbl(b(0)), CDbl(b(1)), CDbl(b(2)), CDbl(b(3)), _
+        CBool(hasRadius), CDbl(radiusValue))
+End Function
+'''
+            application, _ = _catia_application(ctx)
+            raw = list(_evaluate(
+                application,
+                script,
+                "MCP_AnnotationGeometryDescriptor",
+                [obj],
+            ))
+            if len(raw) != 19:
+                raise RuntimeError("CATIA returned an invalid geometry descriptor.")
+            return {
+                "type_name": str(raw[0]),
+                "point": (float(raw[2]), float(raw[3])) if bool(raw[1]) else None,
+                "center": (float(raw[5]), float(raw[6])) if bool(raw[4]) else None,
+                "line": (
+                    float(raw[8]), float(raw[9]), float(raw[10]), float(raw[11])
+                ) if bool(raw[7]) else None,
+                "range": (
+                    float(raw[13]), float(raw[14]), float(raw[15]), float(raw[16])
+                ) if bool(raw[12]) else None,
+                "radius": float(raw[18]) if bool(raw[17]) else None,
+            }
+
         def _extract_element_anchor(
                 element: Any,
+                preferred_point: Optional[Tuple[float, float]] = None,
         ) -> Optional[Tuple[float, float]]:
             """尝试从不同类型的二维几何元素中取得合理的 Leader 锚点。
 
@@ -3517,6 +3576,114 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
             """
             if element is None:
                 return None
+
+            try:
+                descriptor = _catia_geometry_descriptor(element)
+            except Exception:
+                descriptor = {}
+
+            descriptor_center = descriptor.get("center")
+            descriptor_radius = descriptor.get("radius")
+            if (
+                    descriptor_center is not None
+                    and descriptor_radius is not None
+                    and math.isfinite(float(descriptor_radius))
+                    and float(descriptor_radius) > 0.0
+            ):
+                center_x, center_y = descriptor_center
+                radius_value = float(descriptor_radius)
+                target = preferred_point or (center_x + radius_value, center_y)
+                dx, dy = target[0] - center_x, target[1] - center_y
+                length = math.hypot(dx, dy)
+                if length <= 1.0e-12:
+                    return (center_x + radius_value, center_y)
+                return (
+                    center_x + radius_value * dx / length,
+                    center_y + radius_value * dy / length,
+                )
+
+            descriptor_line = descriptor.get("line")
+            if descriptor_line is not None:
+                origin_x, origin_y, direction_x, direction_y = descriptor_line
+                length_squared = direction_x ** 2 + direction_y ** 2
+                if length_squared > 1.0e-18:
+                    target = preferred_point or (origin_x, origin_y)
+                    parameter = (
+                        (target[0] - origin_x) * direction_x
+                        + (target[1] - origin_y) * direction_y
+                    ) / length_squared
+                    candidate = (
+                        origin_x + parameter * direction_x,
+                        origin_y + parameter * direction_y,
+                    )
+                    range_box = descriptor.get("range")
+                    if range_box is not None:
+                        xmin, ymin, xmax, ymax = range_box
+                        candidate = (
+                            max(min(candidate[0], max(xmin, xmax)), min(xmin, xmax)),
+                            max(min(candidate[1], max(ymin, ymax)), min(ymin, ymax)),
+                        )
+                    return candidate
+
+            descriptor_point = descriptor.get("point")
+            if descriptor_point is not None:
+                return descriptor_point
+
+            # 圆/圆弧必须落到圆周，不能把中心点当作 GDT 箭头落点。
+            center: Optional[Tuple[float, float]] = None
+            for center_attr in ("Center", "CenterPoint"):
+                try:
+                    center_obj = getattr(element, center_attr)
+                    center = _extract_element_anchor(center_obj)
+                    if center is not None:
+                        break
+                except Exception:
+                    continue
+            try:
+                radius = float(getattr(element, "Radius"))
+            except Exception:
+                radius = 0.0
+            if center is not None and math.isfinite(radius) and radius > 0.0:
+                target = preferred_point or (center[0] + radius, center[1])
+                dx = target[0] - center[0]
+                dy = target[1] - center[1]
+                length = math.hypot(dx, dy)
+                if length <= 1.0e-12:
+                    return (center[0] + radius, center[1])
+                return (
+                    center[0] + radius * dx / length,
+                    center[1] + radius * dy / length,
+                )
+
+            # 对有明确端点的直线/曲线，将期望点投影到线段上，而不是随意取首端点。
+            endpoints: list[Tuple[float, float]] = []
+            for point_attr in ("StartPoint", "EndPoint"):
+                try:
+                    point_obj = getattr(element, point_attr)
+                except Exception:
+                    point_obj = None
+                if point_obj is not None:
+                    point = _extract_element_anchor(point_obj)
+                    if point is not None:
+                        endpoints.append(point)
+            if len(endpoints) == 2:
+                start, end = endpoints
+                vx, vy = end[0] - start[0], end[1] - start[1]
+                length_squared = vx * vx + vy * vy
+                if length_squared > 1.0e-18:
+                    target = preferred_point or (
+                        (start[0] + end[0]) / 2.0,
+                        (start[1] + end[1]) / 2.0,
+                    )
+                    parameter = (
+                        (target[0] - start[0]) * vx
+                        + (target[1] - start[1]) * vy
+                    ) / length_squared
+                    parameter = max(0.0, min(1.0, parameter))
+                    return (
+                        start[0] + parameter * vx,
+                        start[1] + parameter * vy,
+                    )
 
             # 1. 常见 Point2D / 几何对象直接坐标属性。
             for x_name, y_name in (
@@ -3546,31 +3713,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 except Exception:
                     pass
 
-            # 3. 对线段/曲线优先使用端点，端点更适合作为 Leader 箭头落点。
-            for point_attr in ("StartPoint", "EndPoint"):
-                try:
-                    point_obj = getattr(element, point_attr)
-                except Exception:
-                    point_obj = None
-
-                if point_obj is not None:
-                    point = _extract_element_anchor(point_obj)
-                    if point is not None:
-                        return point
-
-            # 4. 对圆或圆弧等对象，可退化使用中心点。
-            for center_attr in ("Center", "CenterPoint"):
-                try:
-                    center_obj = getattr(element, center_attr)
-                except Exception:
-                    center_obj = None
-
-                if center_obj is not None:
-                    point = _extract_element_anchor(center_obj)
-                    if point is not None:
-                        return point
-
-            # 5. 对暴露 GetPoints/GetPoint 的对象尝试取得第一个二维点。
+            # 3. 对暴露 GetPoints/GetPoint 的对象尝试取得第一个二维点。
             try:
                 get_points = getattr(element, "GetPoints")
             except Exception:
@@ -3615,6 +3758,26 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                         pass
 
             return None
+
+        def _is_attachable_contour(element: Any) -> tuple[bool, str]:
+            """Reject axes and helper/standalone points as manufacturing contours."""
+            name = (_object_name(element) or "").casefold()
+            type_tokens: list[str] = [
+                type(element).__name__.casefold(),
+                _catia_type_name(element).casefold(),
+            ]
+            combined = " ".join(type_tokens)
+            if "axis2d" in combined:
+                return False, "structural_axis"
+            if name.startswith("mcp_helper_"):
+                return False, "mcp_dimension_support"
+            if "point2d" in combined:
+                return False, "point_support_not_contour"
+            if any(token in combined for token in (
+                    "line2d", "circle2d", "ellipse2d", "curve2d", "spline2d",
+            )):
+                return True, "projected_contour_candidate"
+            return False, "unsupported_or_unverified_geometry_type"
 
         def _find_view_element(
                 view: Any,
@@ -3855,6 +4018,11 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
 
             datums = _datum_references(datum_refs)
             frame_position = _point2(position_xy, "position_xy")
+            attachment_tolerance = float(attachment_tolerance_mm)
+            if not math.isfinite(attachment_tolerance) or attachment_tolerance <= 0.0:
+                raise ValueError("attachment_tolerance_mm must be a positive finite number.")
+            if not isinstance(require_geometry_attachment, bool):
+                raise ValueError("require_geometry_attachment must be a boolean.")
 
             document = _active_drawing_document(ctx)
             sheet = _active_sheet(document)
@@ -3893,13 +4061,53 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                         "cannot be established."
                     )
 
+                if attached_element_obj is not None:
+                    attachable, geometry_role = _is_attachable_contour(
+                        attached_element_obj
+                    )
+                    if not attachable:
+                        raise AnnotationOperationError(
+                            "attach_element is not a verified drawing contour and cannot "
+                            "be used as a GD&T leader target.",
+                            data={
+                                "attach_element": attached_element_name
+                                                  or requested_attach_name,
+                                "geometry_role": geometry_role,
+                                "view_name": view_name,
+                            },
+                        )
+
             if leader_xy is not None:
-                # Agent 显式提供的几何投影点优先级最高。
-                leader_position = _point2(leader_xy, "leader_xy")
-                leader_position_source = "explicit_leader_xy"
+                requested_leader_position = _point2(leader_xy, "leader_xy")
+                if attached_element_obj is not None:
+                    leader_position = _extract_element_anchor(
+                        attached_element_obj,
+                        preferred_point=requested_leader_position,
+                    )
+                    if leader_position is None:
+                        raise AnnotationOperationError(
+                            "The requested leader point could not be projected onto the "
+                            "selected drawing contour.",
+                            data={
+                                "attach_element": attached_element_name,
+                                "requested_leader_xy": list(requested_leader_position),
+                            },
+                        )
+                    snap_distance = math.dist(
+                        requested_leader_position,
+                        leader_position,
+                    )
+                    leader_position_source = "explicit_xy_snapped_to_attach_element"
+                else:
+                    leader_position = requested_leader_position
+                    snap_distance = None
+                    leader_position_source = "explicit_leader_xy_unassociated"
             elif attached_element_obj is not None:
                 # 未提供 leader_xy 时，才尝试从 attach_element 自动推导坐标。
-                inferred_anchor = _extract_element_anchor(attached_element_obj)
+                inferred_anchor = _extract_element_anchor(
+                    attached_element_obj,
+                    preferred_point=frame_position,
+                )
 
                 if inferred_anchor is None:
                     raise AnnotationOperationError(
@@ -3918,6 +4126,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "leader_xy",
                 )
                 leader_position_source = "attach_element_inferred"
+                snap_distance = 0.0
 
                 warnings.append(
                     "leader_xy was not supplied explicitly; it was inferred from "
@@ -3934,6 +4143,18 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     data={
                         "view_name": view_name,
                         "position_xy": list(frame_position),
+                    },
+                )
+
+            if require_geometry_attachment and attached_element_obj is None:
+                raise AnnotationOperationError(
+                    "A GD&T leader must be attached to a verified drawing contour. "
+                    "Pass attach_element from catia_list_2d_drawing_geometry; an "
+                    "unverified coordinate-only leader is not accepted.",
+                    data={
+                        "view_name": view_name,
+                        "leader_xy": list(leader_position),
+                        "projected_geometry_required": True,
                     },
                 )
 
@@ -4065,9 +4286,18 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     primary_leader.HeadTarget = attached_element_obj
                     head_target_attached = True
                 except Exception as exc:
-                    # 如果用户显式要求 attach_element，则“坐标接近”不能假装成真正关联。
-                    # 保留 GDT 仍然允许在 leader_xy 显式存在时按坐标创建，但明确警告。
                     head_target_attached = False
+                    if require_geometry_attachment:
+                        raise AnnotationOperationError(
+                            "DrawingLeader.HeadTarget could not be attached to the "
+                            "selected drawing contour.",
+                            data={
+                                "attach_element": attached_element_name
+                                                  or requested_attach_name,
+                                "leader_xy": list(leader_position),
+                                "head_target_error": str(exc),
+                            },
+                        ) from exc
                     warnings.append(
                         "DrawingLeader.HeadTarget could not be attached to "
                         f"'{attached_element_name or requested_attach_name}': {exc}"
@@ -4155,8 +4385,8 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     else "coordinate_only"
                 )
             else:
-                leader_attached = bool(leader_count_after_update >= 1)
-                attachment_method = "leader_xy"
+                leader_attached = False
+                attachment_method = "coordinate_only_unverified"
 
             return _success(
                 {
@@ -4189,6 +4419,8 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "leader_attached": leader_attached,
                     "leader_position_mm": list(leader_position),
                     "leader_position_source": leader_position_source,
+                    "leader_snap_distance_mm": snap_distance,
+                    "attachment_tolerance_mm": attachment_tolerance,
                     "leader_count": leader_count_after_update,
                     "leader_geometry": leader_geometry,
 
@@ -4197,6 +4429,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "attach_element_name": attached_element_name,
                     "head_target_attached": head_target_attached,
                     "attachment_method": attachment_method,
+                    "geometry_attachment_required": require_geometry_attachment,
 
                     # 箭头样式属于 best-effort，不影响 GDT 成功判定。
                     "leader_head_symbol_applied": head_symbol_applied,

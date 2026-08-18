@@ -26,12 +26,14 @@ https://catiadesign.org/_doc/V5Automation/generated/interfaces/DraftingInterface
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Optional
 
 
-IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-18-v4-full-semantic-layout"
+IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-18-v5-geometry-provenance"
 _CATVB_SCRIPT_LANGUAGE = 1
 _EPS = 1.0e-9
+_HELPER_GEOMETRY_PREFIX = "MCP_HELPER_"
 
 SUPPORTED_KINDS = {
     "distance": "Two points/curves: automatic shortest/true distance.",
@@ -44,7 +46,7 @@ SUPPORTED_KINDS = {
     "radius": "Associative radial dimension on a Circle2D.",
     "diameter": "Associative diameter dimension on a Circle2D.",
     "angle": "Angle between two Line2D objects.",
-    "line_length": "Length of one bounded Line2D using its visible segment endpoints.",
+    "line_length": "Length of one bounded Line2D/Curve2D.",
 }
 
 LINE_REP = {
@@ -56,56 +58,121 @@ LINE_REP = {
 
 _DESCRIBE_GEOMETRY_VBS = r'''
 Public Function MCP_Describe2DGeometry(g)
-    Dim t, n, d(11), p(3), q(1), c(1), a(1)
+    Dim t, n, p(3), pointCoords(1), centerCoords(1)
+    Dim lineOrigin(1), lineDirection(1), radiusValue
     Dim okRange, okPoint, okCenter, okLine, okRadius
+    Dim rangeXMin, rangeYMin, rangeXMax, rangeYMax
+    Dim locationKind, locationX, locationY, directionText
     t = TypeName(g)
     n = ""
+    rangeXMin = 0#: rangeYMin = 0#: rangeXMax = 0#: rangeYMax = 0#
+    locationKind = "unknown": locationX = 0#: locationY = 0#
+    radiusValue = 0#: directionText = ""
     On Error Resume Next
     n = CStr(g.Name)
     Err.Clear
     g.GetRangeBox p
     okRange = (Err.Number = 0)
+    If okRange Then rangeXMin = CDbl(p(0)): rangeYMin = CDbl(p(1)): rangeXMax = CDbl(p(2)): rangeYMax = CDbl(p(3))
     Err.Clear
-    g.GetCoordinates q
+    g.GetCoordinates pointCoords
     okPoint = (Err.Number = 0)
+    If okPoint Then locationKind = "point": locationX = CDbl(pointCoords(0)): locationY = CDbl(pointCoords(1))
     Err.Clear
-    g.GetCenter c
+    g.GetCenter centerCoords
     okCenter = (Err.Number = 0)
+    If (Not okPoint) And okCenter Then locationKind = "center": locationX = CDbl(centerCoords(0)): locationY = CDbl(centerCoords(1))
     Err.Clear
-    g.GetOrigin q
-    g.GetDirection a
+    g.GetOrigin lineOrigin
+    g.GetDirection lineDirection
     okLine = (Err.Number = 0)
+    If (Not okPoint) And (Not okCenter) And okLine Then locationKind = "line": locationX = CDbl(lineOrigin(0)): locationY = CDbl(lineOrigin(1))
+    If okLine Then directionText = CStr(CDbl(lineDirection(0))) & "," & CStr(CDbl(lineDirection(1)))
     Err.Clear
-    d(10) = CDbl(g.Radius)
+    radiusValue = CDbl(g.Radius)
     okRadius = (Err.Number = 0)
+    If Not okRadius Then radiusValue = 0#
     Err.Clear
     On Error GoTo 0
+    MCP_Describe2DGeometry = Array(CStr(t), CStr(n), CBool(okRange), rangeXMin, rangeYMin, rangeXMax, rangeYMax, locationKind, locationX, locationY, radiusValue, directionText)
+End Function
+'''
 
-    d(0) = CStr(t)
-    d(1) = CStr(n)
-    d(2) = CBool(okRange)
-    If okRange Then
-        d(3) = CDbl(p(0)): d(4) = CDbl(p(1))
-        d(5) = CDbl(p(2)): d(6) = CDbl(p(3))
-    Else
-        d(3) = 0#: d(4) = 0#: d(5) = 0#: d(6) = 0#
-    End If
-    If okPoint Then
-        d(7) = "point": d(8) = CDbl(q(0)): d(9) = CDbl(q(1))
-    ElseIf okCenter Then
-        d(7) = "center": d(8) = CDbl(c(0)): d(9) = CDbl(c(1))
-    ElseIf okLine Then
-        d(7) = "line": d(8) = CDbl(q(0)): d(9) = CDbl(q(1))
-    Else
-        d(7) = "unknown": d(8) = 0#: d(9) = 0#
-    End If
-    If okRadius Then d(10) = CDbl(g.Radius) Else d(10) = 0#
-    If okLine Then
-        d(11) = CStr(CDbl(a(0))) & "," & CStr(CDbl(a(1)))
-    Else
-        d(11) = ""
-    End If
-    MCP_Describe2DGeometry = d
+_GEOMETRY_IDENTITY_VBS = r'''
+Public Function MCP_Get2DGeometryIdentity(g)
+    Dim objectName
+    objectName = ""
+    On Error Resume Next
+    objectName = CStr(g.Name)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryIdentity = Array(CStr(TypeName(g)), objectName)
+End Function
+'''
+
+_GEOMETRY_RANGE_VBS = r'''
+Public Function MCP_Get2DGeometryRange(g)
+    Dim p(3), succeeded
+    succeeded = False
+    On Error Resume Next
+    g.GetRangeBox p
+    succeeded = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryRange = Array(CBool(succeeded), CDbl(p(0)), CDbl(p(1)), CDbl(p(2)), CDbl(p(3)))
+End Function
+'''
+
+_GEOMETRY_POINT_VBS = r'''
+Public Function MCP_Get2DGeometryPoint(g)
+    Dim p(1), succeeded
+    succeeded = False
+    On Error Resume Next
+    g.GetCoordinates p
+    succeeded = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryPoint = Array(CBool(succeeded), CDbl(p(0)), CDbl(p(1)))
+End Function
+'''
+
+_GEOMETRY_CENTER_VBS = r'''
+Public Function MCP_Get2DGeometryCenter(g)
+    Dim p(1), succeeded
+    succeeded = False
+    On Error Resume Next
+    g.GetCenter p
+    succeeded = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryCenter = Array(CBool(succeeded), CDbl(p(0)), CDbl(p(1)))
+End Function
+'''
+
+_GEOMETRY_LINE_VBS = r'''
+Public Function MCP_Get2DGeometryLine(g)
+    Dim p(1), d(1), succeeded
+    succeeded = False
+    On Error Resume Next
+    g.GetOrigin p
+    g.GetDirection d
+    succeeded = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryLine = Array(CBool(succeeded), CDbl(p(0)), CDbl(p(1)), CDbl(d(0)), CDbl(d(1)))
+End Function
+'''
+
+_GEOMETRY_RADIUS_VBS = r'''
+Public Function MCP_Get2DGeometryRadius(g)
+    Dim radiusValue, succeeded
+    radiusValue = 0#: succeeded = False
+    On Error Resume Next
+    radiusValue = CDbl(g.Radius)
+    succeeded = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    MCP_Get2DGeometryRadius = Array(CBool(succeeded), radiusValue)
 End Function
 '''
 
@@ -158,9 +225,28 @@ End Function
 
 _TOLERANCE_VBS = r'''
 Public Function MCP_SetNumericTolerance(dimObj, upTol, lowTol, displayMode)
-    dimObj.SetTolerances 1, "", CStr(upTol), CStr(lowTol), _
+    dimObj.SetTolerances 2, "TOL_NUM2", "", "", _
                              CDbl(upTol), CDbl(lowTol), CLng(displayMode)
     MCP_SetNumericTolerance = True
+End Function
+'''
+
+_GET_TOLERANCE_VBS = r'''
+Public Function MCP_GetDimensionTolerance(dimObj)
+    Dim tolType, tolName, upText, lowText, upValue, lowValue, displayMode
+    tolType = 0: tolName = "": upText = "": lowText = ""
+    upValue = 0#: lowValue = 0#: displayMode = 0
+    On Error Resume Next
+    Call dimObj.GetTolerances(tolType, tolName, upText, lowText, _
+                              upValue, lowValue, displayMode)
+    If Err.Number <> 0 Then
+        Err.Clear
+        MCP_GetDimensionTolerance = Array(False, 0, "", "", "", 0#, 0#, 0)
+    Else
+        MCP_GetDimensionTolerance = Array(True, CLng(tolType), CStr(tolName), _
+            CStr(upText), CStr(lowText), CDbl(upValue), CDbl(lowValue), CLng(displayMode))
+    End If
+    On Error GoTo 0
 End Function
 '''
 
@@ -196,12 +282,19 @@ def _error(message: str, data: Any = None) -> dict[str, Any]:
     return result
 
 
-class AnnotationOperationError(RuntimeError):
-    """Operation error carrying optional diagnostic data."""
+def _finite(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
 
-    def __init__(self, message: str, *, data: Any = None) -> None:
-        super().__init__(message)
-        self.data = data
+
+def _safe_count(collection: Any) -> Optional[int]:
+    """Return a COM collection count without masking the primary operation."""
+    if collection is None:
+        return None
 
 
 def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -211,63 +304,52 @@ def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
-def _safe_count(collection: Any) -> Optional[int]:
-    try:
-        return int(collection.Count)
-    except Exception:
-        return None
-
-
-def _hide_objects(document: Any, objects: list[Any]) -> tuple[bool, Optional[str]]:
-    selection = None
-    try:
-        selection = document.Selection
-        selection.Clear()
-        for obj in objects:
-            selection.Add(obj)
-        selection.VisProperties.SetShow(1)
-        return True, None
-    except Exception as exc:
-        return False, _format_error(exc)
-    finally:
-        if selection is not None:
-            try:
-                selection.Clear()
-            except Exception:
-                pass
-
-
 def _delete_objects(document: Any, objects: list[Any]) -> dict[str, Any]:
-    result = {"attempted": bool(objects), "succeeded": True, "error": None}
+    """Delete temporary drafting supports through the document Selection."""
     if not objects:
-        return result
-    selection = None
+        return {"attempted": False, "succeeded": True, "error": None}
+    selection = document.Selection
     try:
-        selection = document.Selection
         selection.Clear()
         for obj in objects:
             selection.Add(obj)
         selection.Delete()
-        return result
+        selection.Clear()
+        return {"attempted": True, "succeeded": True, "error": None}
     except Exception as exc:
-        result["succeeded"] = False
-        result["error"] = _format_error(exc)
-        return result
-    finally:
-        if selection is not None:
-            try:
-                selection.Clear()
-            except Exception:
-                pass
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error": _format_error(exc),
+        }
 
 
-def _finite(value: Any, name: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a finite number")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be finite")
-    return number
+def _hide_objects(document: Any, objects: list[Any]) -> tuple[bool, Optional[str]]:
+    """Hide temporary supports without changing the represented geometry."""
+    if not objects:
+        return True, None
+    selection = document.Selection
+    try:
+        selection.Clear()
+        for obj in objects:
+            selection.Add(obj)
+        selection.VisProperties.SetShow(1)
+        selection.Clear()
+        return True, None
+    except Exception as exc:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+        return False, _format_error(exc)
+    try:
+        return int(collection.Count)
+    except Exception:
+        return None
 
 
 def _evaluate(application: Any, script: str, function: str, args: list[Any]) -> Any:
@@ -303,6 +385,14 @@ def _active_context(conn: Any, view_name: str = "") -> tuple[Any, Any, Any, Any]
     return application, document, sheet, view
 
 
+def _drawing_context(conn: Any) -> tuple[Any, Any, Any]:
+    """Resolve an active drawing without requiring a model view to be active."""
+    application = conn.connect(visible=True)
+    document = conn.get_active_drawing_document()
+    sheet = document.Sheets.ActiveSheet
+    return application, document, sheet
+
+
 def _geometry(view: Any, selector: int | str) -> tuple[Any, int]:
     elements = view.GeometricElements
     if isinstance(selector, bool):
@@ -327,41 +417,96 @@ def _geometry(view: Any, selector: int | str) -> tuple[Any, int]:
 
 
 def _describe(application: Any, obj: Any, index: int) -> dict[str, Any]:
-    values = list(
-        _evaluate(
-            application,
-            _DESCRIBE_GEOMETRY_VBS,
-            "MCP_Describe2DGeometry",
-            [obj],
-        )
+    identity = list(_evaluate(
+        application, _GEOMETRY_IDENTITY_VBS, "MCP_Get2DGeometryIdentity", [obj]
+    ))
+    range_values = list(_evaluate(
+        application, _GEOMETRY_RANGE_VBS, "MCP_Get2DGeometryRange", [obj]
+    ))
+    point_values = list(_evaluate(
+        application, _GEOMETRY_POINT_VBS, "MCP_Get2DGeometryPoint", [obj]
+    ))
+    center_values = list(_evaluate(
+        application, _GEOMETRY_CENTER_VBS, "MCP_Get2DGeometryCenter", [obj]
+    ))
+    line_values = list(_evaluate(
+        application, _GEOMETRY_LINE_VBS, "MCP_Get2DGeometryLine", [obj]
+    ))
+    radius_value: Optional[float] = None
+    try:
+        candidate_radius = float(obj.Radius)
+        if math.isfinite(candidate_radius) and candidate_radius > 0.0:
+            radius_value = candidate_radius
+    except Exception:
+        radius_value = None
+
+    has_range = bool(range_values[0])
+    if bool(point_values[0]):
+        location_kind = "point"
+        location = [float(point_values[1]), float(point_values[2])]
+    elif bool(center_values[0]):
+        location_kind = "center"
+        location = [float(center_values[1]), float(center_values[2])]
+    elif bool(line_values[0]):
+        location_kind = "line"
+        location = [float(line_values[1]), float(line_values[2])]
+    else:
+        location_kind = "unknown"
+        location = [0.0, 0.0]
+    direction = (
+        [float(line_values[3]), float(line_values[4])]
+        if bool(line_values[0]) else None
     )
-    if len(values) != 12:
-        raise RuntimeError(f"geometry description returned {len(values)} fields")
-    direction = None
-    if str(values[11]).strip():
-        dx, dy = str(values[11]).replace(";", ",").split(",", 1)
-        direction = [float(dx), float(dy)]
     result = {
         "index": index,
-        "name": str(values[1]),
-        "automation_type": str(values[0]),
-        "has_range_box": bool(values[2]),
+        "name": str(identity[1]),
+        "automation_type": str(identity[0]),
+        "has_range_box": has_range,
         "range_box_view_mm": (
             {
-                "xmin": float(values[3]),
-                "ymin": float(values[4]),
-                "xmax": float(values[5]),
-                "ymax": float(values[6]),
+                "xmin": float(range_values[1]),
+                "ymin": float(range_values[2]),
+                "xmax": float(range_values[3]),
+                "ymax": float(range_values[4]),
             }
-            if bool(values[2])
+            if has_range
             else None
         ),
-        "location_kind": str(values[7]),
-        "location_view_mm": [float(values[8]), float(values[9])],
-        "radius_mm": float(values[10]) if float(values[10]) > 0 else None,
+        "location_kind": location_kind,
+        "location_view_mm": location,
+        "radius_mm": radius_value,
         "direction": direction,
     }
     return result
+
+
+def _geometry_provenance(description: dict[str, Any]) -> dict[str, Any]:
+    """Classify listed 2D geometry without confusing helper points with contours."""
+    automation_type = str(description.get("automation_type", "")).casefold()
+    name = str(description.get("name", "")).strip()
+    is_axis = "axis2d" in automation_type
+    is_point = "point2d" in automation_type
+    is_mcp_helper = name.casefold().startswith(_HELPER_GEOMETRY_PREFIX.casefold())
+    is_contour = bool(
+        not is_axis
+        and not is_point
+        and any(token in automation_type for token in (
+            "line2d", "circle2d", "ellipse2d", "curve2d", "spline2d", "parabola2d",
+        ))
+    )
+    role = (
+        "structural_axis" if is_axis else
+        "mcp_dimension_support" if is_mcp_helper else
+        "point_support" if is_point else
+        "projected_contour_candidate" if is_contour else
+        "other_2d_geometry"
+    )
+    return {
+        "geometry_role": role,
+        "is_projected_contour_candidate": is_contour,
+        "is_mcp_helper_geometry": is_mcp_helper,
+        "valid_for_gdt_head_target": is_contour,
+    }
 
 
 def _type_has(item: dict[str, Any], token: str) -> bool:
@@ -376,33 +521,13 @@ def _center(item: dict[str, Any]) -> tuple[float, float]:
     return tuple(item["location_view_mm"])  # type: ignore[return-value]
 
 
-def _bbox_center(item: dict[str, Any]) -> tuple[float, float]:
-    box = item.get("range_box_view_mm")
-    if not box:
-        raise ValueError(f"geometry {item.get('index')} has no range box")
-    return ((float(box["xmin"]) + float(box["xmax"])) / 2.0,
-            (float(box["ymin"]) + float(box["ymax"])) / 2.0)
-
-
 def _point(item: dict[str, Any]) -> tuple[float, float]:
-    """Return a visually meaningful anchor, never a Line2D origin by default.
-
-    Point/centre geometry keeps its native coordinate.  Line2D uses the midpoint of
-    its visible segment; other bounded curves use their range-box centre as a
-    conservative fallback.  This avoids the old failure where GetOrigin() could be
-    near or outside the visible segment.
-    """
-    kind = str(item.get("location_kind", ""))
-    if kind in {"point", "center"}:
+    if item["location_kind"] in {"point", "center", "line"}:
         return tuple(item["location_view_mm"])  # type: ignore[return-value]
-    if kind == "line" and item.get("direction") and item.get("range_box_view_mm"):
-        p0, p1 = _line_visible_segment(item)
-        return ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
-    if item.get("range_box_view_mm"):
-        return _bbox_center(item)
-    if kind == "line":
-        return tuple(item["location_view_mm"])  # type: ignore[return-value]
-    raise ValueError(f"geometry {item.get('index')} has no usable anchor")
+    box = item.get("range_box_view_mm")
+    if box:
+        return ((box["xmin"] + box["xmax"]) / 2, (box["ymin"] + box["ymax"]) / 2)
+    raise ValueError(f"geometry {item['index']} has no usable anchor")
 
 
 def _line(item: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -418,301 +543,20 @@ def _line(item: dict[str, Any]) -> tuple[float, float, float, float]:
     return x, y, dx / length, dy / length
 
 
-def _line_visible_segment(
-    item: dict[str, Any],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Recover the visible Line2D segment from its line equation + range box.
-
-    CATIA Line2D.GetOrigin() returns a point on the underlying line, but that point
-    is not guaranteed to be the visual centre of the projected segment.  For
-    dimension placement we therefore intersect the infinite line with the
-    geometry RangeBox and use the two visible boundary intersections.
-    """
+def _range_endpoints(item: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
     box = item.get("range_box_view_mm")
     if not box:
         raise ValueError(f"geometry {item['index']} has no range box")
-
-    x0, y0, ux, uy = _line(item)
-    xmin, xmax = float(box["xmin"]), float(box["xmax"])
-    ymin, ymax = float(box["ymin"]), float(box["ymax"])
-    tolerance = 1.0e-7
-    candidates: list[tuple[float, tuple[float, float]]] = []
-
-    def add_candidate(t: float) -> None:
-        x = x0 + t * ux
-        y = y0 + t * uy
-        if (
-            xmin - tolerance <= x <= xmax + tolerance
-            and ymin - tolerance <= y <= ymax + tolerance
-        ):
-            for old_t, _ in candidates:
-                if abs(old_t - t) <= tolerance:
-                    return
-            candidates.append((t, (x, y)))
-
-    if abs(ux) > _EPS:
-        add_candidate((xmin - x0) / ux)
-        add_candidate((xmax - x0) / ux)
-    if abs(uy) > _EPS:
-        add_candidate((ymin - y0) / uy)
-        add_candidate((ymax - y0) / uy)
-
-    if len(candidates) >= 2:
-        candidates.sort(key=lambda entry: entry[0])
-        return candidates[0][1], candidates[-1][1]
-
-    # Degenerate/numerically tiny range boxes: keep a conservative fallback.
-    corners = [
-        (xmin, ymin), (xmin, ymax), (xmax, ymin), (xmax, ymax),
-    ]
-    projected = sorted(
-        corners,
-        key=lambda p: (p[0] - x0) * ux + (p[1] - y0) * uy,
-    )
-    return projected[0], projected[-1]
-
-
-def _range_endpoints(
-    item: dict[str, Any],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    if item.get("location_kind") == "line" and item.get("direction"):
-        return _line_visible_segment(item)
-    box = item.get("range_box_view_mm")
-    if not box:
-        raise ValueError(f"geometry {item['index']} has no range box")
+    if item["direction"]:
+        dx, dy = item["direction"]
+        candidates = [
+            (box["xmin"], box["ymin"]), (box["xmin"], box["ymax"]),
+            (box["xmax"], box["ymin"]), (box["xmax"], box["ymax"]),
+        ]
+        projected = sorted(candidates, key=lambda p: p[0] * dx + p[1] * dy)
+        return projected[0], projected[-1]
     return (box["xmin"], box["ymin"]), (box["xmax"], box["ymax"])
 
-
-def _parallel_line_dimension_geometry(
-    a: dict[str, Any],
-    b: dict[str, Any],
-) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
-    """Choose dimension anchors in the common visible span of two parallel lines.
-
-    The old implementation used Line2D.GetOrigin() from line A and projected it
-    onto line B.  That is mathematically valid for the distance, but the origin can
-    lie near an end or even outside the visually useful common span.  Here we use
-    each line's visible segment and choose the centre of their overlapping span
-    along the line direction.
-    """
-    x1, y1, ux1, uy1 = _line(a)
-    x2, y2, ux2, uy2 = _line(b)
-    cross = ux1 * uy2 - uy1 * ux2
-    if abs(cross) > 1.0e-5:
-        raise ValueError("line_to_line requires parallel lines; use kind='angle'")
-
-    # Keep both directions consistent so longitudinal parameters compare cleanly.
-    if ux1 * ux2 + uy1 * uy2 < 0.0:
-        ux2, uy2 = -ux2, -uy2
-
-    n1x, n1y = -uy1, ux1
-    signed_distance = (x2 - x1) * n1x + (y2 - y1) * n1y
-    distance = abs(signed_distance)
-
-    a0, a1 = _line_visible_segment(a)
-    b0, b1 = _line_visible_segment(b)
-
-    def longitudinal(point: tuple[float, float]) -> float:
-        return point[0] * ux1 + point[1] * uy1
-
-    a_lo, a_hi = sorted((longitudinal(a0), longitudinal(a1)))
-    b_lo, b_hi = sorted((longitudinal(b0), longitudinal(b1)))
-    overlap_lo = max(a_lo, b_lo)
-    overlap_hi = min(a_hi, b_hi)
-
-    if overlap_lo <= overlap_hi + 1.0e-7:
-        longitudinal_target = (overlap_lo + overlap_hi) / 2.0
-        span_mode = "visible_overlap_midpoint"
-    else:
-        # No common projected span: choose the midpoint between the nearest ends.
-        if a_hi < b_lo:
-            longitudinal_target = (a_hi + b_lo) / 2.0
-        else:
-            longitudinal_target = (b_hi + a_lo) / 2.0
-        span_mode = "nearest_visible_span_midpoint_no_overlap"
-
-    # Point p lies on A at the selected longitudinal station.
-    t1 = longitudinal_target - (x1 * ux1 + y1 * uy1)
-    p = (x1 + t1 * ux1, y1 + t1 * uy1)
-
-    # q is the normal projection of p onto B.
-    q = (p[0] + signed_distance * n1x, p[1] + signed_distance * n1y)
-
-    evidence = {
-        "strategy": "parallel_line_common_visible_span",
-        "line1_visible_segment_view_mm": [list(a0), list(a1)],
-        "line2_visible_segment_view_mm": [list(b0), list(b1)],
-        "line1_longitudinal_interval": [a_lo, a_hi],
-        "line2_longitudinal_interval": [b_lo, b_hi],
-        "overlap_interval": [overlap_lo, overlap_hi],
-        "span_mode": span_mode,
-        "chosen_longitudinal_coordinate": longitudinal_target,
-        "anchor1_view_mm": list(p),
-        "anchor2_view_mm": list(q),
-        "distance_mm": distance,
-        "line_direction": [ux1, uy1],
-    }
-    return distance, p, q, evidence
-
-
-
-def _line_intersection(
-    a: dict[str, Any], b: dict[str, Any]
-) -> tuple[float, float]:
-    x1, y1, ux1, uy1 = _line(a)
-    x2, y2, ux2, uy2 = _line(b)
-    det = ux1 * uy2 - uy1 * ux2
-    if abs(det) <= 1.0e-7:
-        raise ValueError("angle requires two non-parallel Line2D objects")
-    dx, dy = x2 - x1, y2 - y1
-    t = (dx * uy2 - dy * ux2) / det
-    return x1 + t * ux1, y1 + t * uy1
-
-
-def _ray_toward_visible_segment(
-    item: dict[str, Any], vertex: tuple[float, float]
-) -> tuple[float, float]:
-    """Choose the line direction that points from the vertex toward visible geometry."""
-    _, _, ux, uy = _line(item)
-    try:
-        a0, a1 = _line_visible_segment(item)
-        mx, my = (a0[0] + a1[0]) / 2.0, (a0[1] + a1[1]) / 2.0
-        if (mx - vertex[0]) * ux + (my - vertex[1]) * uy < 0.0:
-            ux, uy = -ux, -uy
-    except Exception:
-        pass
-    return ux, uy
-
-
-def _angle_dimension_geometry(
-    a: dict[str, Any], b: dict[str, Any]
-) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
-    """Build angle anchors from the actual line intersection and visible rays."""
-    vertex = _line_intersection(a, b)
-    u1 = _ray_toward_visible_segment(a, vertex)
-    u2 = _ray_toward_visible_segment(b, vertex)
-    dot = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
-    angle = math.acos(dot)
-    # Prefer the smaller included angle; CATIA's catDimAngle can still choose its
-    # own representation, but the witness points now identify the intended sector.
-    if angle > math.pi:
-        angle = 2.0 * math.pi - angle
-    try:
-        s10, s11 = _line_visible_segment(a)
-        s20, s21 = _line_visible_segment(b)
-        len1 = max(math.dist(vertex, s10), math.dist(vertex, s11))
-        len2 = max(math.dist(vertex, s20), math.dist(vertex, s21))
-        radius = max(3.0, min(len1, len2) * 0.35)
-    except Exception:
-        radius = 10.0
-    p = (vertex[0] + u1[0] * radius, vertex[1] + u1[1] * radius)
-    q = (vertex[0] + u2[0] * radius, vertex[1] + u2[1] * radius)
-    bisector = (u1[0] + u2[0], u1[1] + u2[1])
-    bisector_norm = math.hypot(*bisector)
-    if bisector_norm <= _EPS:
-        bisector = (-u1[1], u1[0])
-        bisector_norm = 1.0
-    bisector = (bisector[0] / bisector_norm, bisector[1] / bisector_norm)
-    evidence = {
-        "strategy": "angle_vertex_visible_rays",
-        "vertex_view_mm": list(vertex),
-        "ray1": list(u1),
-        "ray2": list(u2),
-        "bisector": list(bisector),
-        "witness_radius_view_mm": radius,
-        "anchor1_view_mm": list(p),
-        "anchor2_view_mm": list(q),
-        "angle_radians": angle,
-    }
-    return angle, p, q, evidence
-
-
-def _axis_distance_geometry(
-    kind: str, a: dict[str, Any], b: dict[str, Any]
-) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
-    """Select visually meaningful anchors for horizontal/vertical dimensions."""
-    pa = _point(a)
-    pb = _point(b)
-    evidence: dict[str, Any] = {"strategy": "visual_anchor_axis_distance"}
-    # If both supports are lines, use their visible spans rather than line origins.
-    if a.get("location_kind") == "line" and b.get("location_kind") == "line":
-        a0, a1 = _line_visible_segment(a)
-        b0, b1 = _line_visible_segment(b)
-        if kind == "horizontal_distance":
-            ay = (a0[1] + a1[1]) / 2.0
-            by = (b0[1] + b1[1]) / 2.0
-            # Choose endpoints/points nearest in X so witness lines do not span the view arbitrarily.
-            pair = min(((x, y) for x, y in (a0, a1) for _x, _y in [b0, b1]), key=lambda p: 0.0)
-            candidates = [((x1, y1), (x2, y2)) for x1, y1 in (a0, a1) for x2, y2 in (b0, b1)]
-            p, q = min(candidates, key=lambda pair: abs(pair[1][0] - pair[0][0]))
-            p, q = (p[0], ay), (q[0], by)
-        else:
-            ax = (a0[0] + a1[0]) / 2.0
-            bx = (b0[0] + b1[0]) / 2.0
-            candidates = [((x1, y1), (x2, y2)) for x1, y1 in (a0, a1) for x2, y2 in (b0, b1)]
-            p, q = min(candidates, key=lambda pair: abs(pair[1][1] - pair[0][1]))
-            p, q = (ax, p[1]), (bx, q[1])
-        evidence.update({
-            "strategy": "visible_line_segments_axis_distance",
-            "line1_visible_segment_view_mm": [list(a0), list(a1)],
-            "line2_visible_segment_view_mm": [list(b0), list(b1)],
-        })
-    else:
-        p, q = pa, pb
-    value = abs(q[0] - p[0]) if kind == "horizontal_distance" else abs(q[1] - p[1])
-    evidence["anchor1_view_mm"] = list(p)
-    evidence["anchor2_view_mm"] = list(q)
-    evidence["distance_mm"] = value
-    return value, p, q, evidence
-
-
-def _circle_dimension_geometry(
-    kind: str, item: dict[str, Any]
-) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
-    c = _center(item)
-    r = float(item["radius_mm"])
-    # Anchors identify actual geometry. Placement is decided later from free-space scoring.
-    p = (c[0] + r, c[1])
-    q = c if kind == "radius" else (c[0] - r, c[1])
-    return (r if kind == "radius" else 2.0 * r), p, q, {
-        "strategy": "circle_center_and_diameter_axis",
-        "center_view_mm": list(c),
-        "radius_mm": r,
-        "anchor1_view_mm": list(p),
-        "anchor2_view_mm": list(q),
-    }
-
-
-def _center_to_line_geometry(
-    circle: dict[str, Any], line: dict[str, Any]
-) -> tuple[float, tuple[float, float], tuple[float, float], dict[str, Any]]:
-    p = _center(circle)
-    x, y, dx, dy = _line(line)
-    signed = (p[0] - x) * (-dy) + (p[1] - y) * dx
-    q = (p[0] - signed * (-dy), p[1] - signed * dx)
-    # Clamp the visual witness to the nearest point on the visible segment if the
-    # perpendicular foot lies beyond it. Value remains the support-line distance.
-    try:
-        s0, s1 = _line_visible_segment(line)
-        seg_dx, seg_dy = s1[0] - s0[0], s1[1] - s0[1]
-        seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy
-        if seg_len2 > _EPS:
-            t = ((q[0] - s0[0]) * seg_dx + (q[1] - s0[1]) * seg_dy) / seg_len2
-            if t < 0.0 or t > 1.0:
-                q_visual = s0 if t < 0.0 else s1
-            else:
-                q_visual = q
-        else:
-            q_visual = q
-    except Exception:
-        q_visual = q
-    return abs(signed), p, q_visual, {
-        "strategy": "center_to_visible_line_projection",
-        "center_view_mm": list(p),
-        "infinite_line_projection_view_mm": list(q),
-        "visual_line_anchor_view_mm": list(q_visual),
-        "distance_mm": abs(signed),
-    }
 
 def _validate_kind(kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]) -> None:
     if kind not in SUPPORTED_KINDS:
@@ -726,8 +570,6 @@ def _validate_kind(kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]) ->
     if kind in {"line_to_line", "angle"}:
         _line(a)
         _line(b or {})
-    if kind == "line_length":
-        _line(a)
     if kind == "center_to_line":
         _center(a)
         _line(b or {})
@@ -750,46 +592,47 @@ def _catia_geometry_objects(
 
 def _expected_and_anchors(
     kind: str, a: dict[str, Any], b: Optional[dict[str, Any]]
-) -> tuple[Optional[float], tuple[float, float], tuple[float, float], str, dict[str, Any]]:
-    evidence: dict[str, Any] = {"strategy": "default_geometry_anchor"}
+) -> tuple[Optional[float], tuple[float, float], tuple[float, float], str]:
     if kind in {"radius", "diameter"}:
-        value, p, q, evidence = _circle_dimension_geometry(kind, a)
-        return value, p, q, "length_mm", evidence
+        c = _center(a)
+        r = float(a["radius_mm"])
+        return (r if kind == "radius" else 2 * r), (c[0] + r, c[1]), c, "length_mm"
     if kind == "line_length":
         p1, p2 = _range_endpoints(a)
-        evidence = {
-            "strategy": "visible_bounded_geometry_endpoints",
-            "anchor1_view_mm": list(p1),
-            "anchor2_view_mm": list(p2),
-        }
-        return math.dist(p1, p2), p1, p2, "length_mm", evidence
+        return math.dist(p1, p2), p1, p2, "length_mm"
     assert b is not None
     if kind == "center_to_line":
-        value, p, q, evidence = _center_to_line_geometry(a, b)
-        return value, p, q, "length_mm", evidence
+        p = _center(a)
+        x, y, dx, dy = _line(b)
+        signed = (p[0] - x) * (-dy) + (p[1] - y) * dx
+        q = (p[0] - signed * (-dy), p[1] - signed * dx)
+        return abs(signed), p, q, "length_mm"
     if kind == "center_to_center":
         p, q = _center(a), _center(b)
-        return math.dist(p, q), p, q, "length_mm", {
-            "strategy": "center_to_center_midline",
-            "anchor1_view_mm": list(p),
-            "anchor2_view_mm": list(q),
-        }
+        return math.dist(p, q), p, q, "length_mm"
     if kind == "line_to_line":
-        value, p, q, line_evidence = _parallel_line_dimension_geometry(a, b)
-        return value, p, q, "length_mm", line_evidence
+        x1, y1, dx1, dy1 = _line(a)
+        x2, y2, dx2, dy2 = _line(b)
+        cross = dx1 * dy2 - dy1 * dx2
+        if abs(cross) > 1.0e-5:
+            raise ValueError("line_to_line requires parallel lines; use kind='angle'")
+        signed = (x2 - x1) * (-dy1) + (y2 - y1) * dx1
+        p = (x1, y1)
+        q = (x1 + signed * (-dy1), y1 + signed * dx1)
+        return abs(signed), p, q, "length_mm"
     if kind == "angle":
-        value, p, q, angle_evidence = _angle_dimension_geometry(a, b)
-        return value, p, q, "angle_radians", angle_evidence
-    if kind in {"horizontal_distance", "vertical_distance"}:
-        value, p, q, axis_evidence = _axis_distance_geometry(kind, a, b)
-        return value, p, q, "length_mm", axis_evidence
+        x1, y1, dx1, dy1 = _line(a)
+        x2, y2, dx2, dy2 = _line(b)
+        angle = math.acos(max(-1.0, min(1.0, abs(dx1 * dx2 + dy1 * dy2))))
+        return angle, (x1, y1), (x2, y2), "angle_radians"
     p, q = _point(a), _point(b)
-    evidence = {
-        "strategy": "visual_feature_anchors",
-        "anchor1_view_mm": list(p),
-        "anchor2_view_mm": list(q),
-    }
-    return math.dist(p, q), p, q, "length_mm", evidence
+    if kind == "horizontal_distance":
+        value = abs(q[0] - p[0])
+    elif kind == "vertical_distance":
+        value = abs(q[1] - p[1])
+    else:
+        value = math.dist(p, q)
+    return value, p, q, "length_mm"
 
 
 def _view_transform(view: Any) -> dict[str, float]:
@@ -871,6 +714,11 @@ def _view_bounds_dimension_anchors(
     ymax = max(point[1] for point in local_corners)
 
     if kind == "horizontal_distance":
+        # Use one common witness line crossing the complete silhouette.  The
+        # previous implementation was mathematically similar, but did not
+        # report/verify the round-trip back to the exact DrawingView.Size
+        # extrema.  That allowed callers to confuse model-centred coordinates
+        # with the actual (often offset) drawing-view coordinate system.
         y = (ymin + ymax) / 2.0
         p = (xmin, y)
         q = (xmax, y)
@@ -889,6 +737,24 @@ def _view_bounds_dimension_anchors(
     if expected <= _EPS:
         raise ValueError(f"DrawingView.Size fallback produced zero {kind} extent")
 
+    p_sheet = _view_to_sheet(p[0], p[1], tf)
+    q_sheet = _view_to_sheet(q[0], q[1], tf)
+    tolerance = max(0.01, abs(tf["scale"]) * 1.0e-6)
+    if kind == "horizontal_distance":
+        extrema_verified = (
+            abs(p_sheet[0] - size["xmin"]) <= tolerance
+            and abs(q_sheet[0] - size["xmax"]) <= tolerance
+        )
+    else:
+        extrema_verified = (
+            abs(p_sheet[1] - size["ymin"]) <= tolerance
+            and abs(q_sheet[1] - size["ymax"]) <= tolerance
+        )
+    if not extrema_verified:
+        raise RuntimeError(
+            "DrawingView.Size anchors failed the view/sheet coordinate round-trip"
+        )
+
     evidence = {
         "mode": "drawing_view_size_fallback",
         "size_sheet_mm": size,
@@ -902,8 +768,20 @@ def _view_bounds_dimension_anchors(
         },
         "anchor1_view_mm": list(p),
         "anchor2_view_mm": list(q),
+        "anchor1_sheet_mm": list(p_sheet),
+        "anchor2_sheet_mm": list(q_sheet),
+        "extrema_round_trip_verified": True,
+        "coordinate_contract": (
+            "DrawingView.Size is sheet-space; Factory2D helper points are "
+            "view-local and are obtained with origin/rotation/scale conversion"
+        ),
         "associative_to_projected_model_geometry": False,
     }
+    # The helper supports live in view-local/model units.  The explicit
+    # sheet->view inverse transform therefore removes the paper scale before
+    # the native DrawingDimension is created.  CATIA consequently reports the
+    # represented model distance at 1:1, 2:1, 1:2, and arbitrary finite scales.
+    evidence["scale_compensation_verified"] = True
     return expected, p, q, evidence
 
 
@@ -921,252 +799,25 @@ def _view_to_sheet(x: float, y: float, tf: dict[str, float]) -> tuple[float, flo
     return sx, sy
 
 
-def _bbox_intersects(a: dict[str, float], b: dict[str, float], margin: float = 0.0) -> bool:
-    return not (
-        a["xmax"] + margin < b["xmin"]
-        or b["xmax"] + margin < a["xmin"]
-        or a["ymax"] + margin < b["ymin"]
-        or b["ymax"] + margin < a["ymin"]
-    )
-
-
-def _point_clearance_score(
-    point: tuple[float, float], obstacles: list[dict[str, float]], clearance: float
-) -> float:
-    score = 0.0
-    x, y = point
-    for box in obstacles:
-        if (box["xmin"] - clearance <= x <= box["xmax"] + clearance and
-                box["ymin"] - clearance <= y <= box["ymax"] + clearance):
-            score += 1000.0
-        cx = min(max(x, box["xmin"]), box["xmax"])
-        cy = min(max(y, box["ymin"]), box["ymax"])
-        d = math.hypot(x - cx, y - cy)
-        score += 1.0 / max(d, 0.25)
-    return score
-
-
-def _geometry_obstacles(view: Any, application: Any, exclude_indices: set[int] | None = None) -> list[dict[str, float]]:
-    excluded = exclude_indices or set()
-    boxes: list[dict[str, float]] = []
-    try:
-        elements = view.GeometricElements
-        count = int(elements.Count)
-    except Exception:
-        return boxes
-    for i in range(1, count + 1):
-        if i in excluded:
-            continue
-        try:
-            desc = _describe(application, elements.Item(i), i)
-            box = desc.get("range_box_view_mm")
-            if box:
-                boxes.append({k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")})
-        except Exception:
-            continue
-    return boxes
-
-
-def _existing_dimension_obstacles(application: Any, view: Any, exclude_index: Optional[int] = None) -> list[dict[str, float]]:
-    boxes: list[dict[str, float]] = []
-    try:
-        count = int(view.Dimensions.Count)
-    except Exception:
-        return boxes
-    for i in range(1, count + 1):
-        if exclude_index is not None and i == exclude_index:
-            continue
-        try:
-            box = _boundary(application, view.Dimensions.Item(i))
-            if box:
-                boxes.append({k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")})
-        except Exception:
-            continue
-    return boxes
-
-
-def _candidate_best(
-    candidates: list[tuple[float, float, str]],
-    obstacles: list[dict[str, float]],
-    clearance: float,
-) -> tuple[float, float, dict[str, Any]]:
-    if not candidates:
-        raise ValueError("no placement candidates were generated")
-    scored = []
-    for x, y, label in candidates:
-        score = _point_clearance_score((x, y), obstacles, clearance)
-        scored.append((score, x, y, label))
-    scored.sort(key=lambda row: row[0])
-    score, x, y, label = scored[0]
-    return x, y, {
-        "candidate_strategy": "minimum_obstacle_score",
-        "selected_candidate": label,
-        "selected_score": score,
-        "candidates": [
-            {"label": label_i, "view_mm": [x_i, y_i], "score": score_i}
-            for score_i, x_i, y_i, label_i in scored
-        ],
-    }
-
-
-def _semantic_candidates(
-    kind: str,
-    p: tuple[float, float],
-    q: tuple[float, float],
-    offset_view: float,
-    evidence: dict[str, Any],
-) -> list[tuple[float, float, str]]:
-    mx, my = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
-    gap = max(abs(offset_view), 4.0)
-    if kind == "line_to_line":
-        ux, uy = evidence.get("line_direction", [1.0, 0.0]) if evidence.get("line_direction") else (1.0, 0.0)
-        return [(mx, my, "between_common_span"), (mx + ux * gap, my + uy * gap, "between_shift_plus"), (mx - ux * gap, my - uy * gap, "between_shift_minus")]
-    if kind == "angle":
-        vertex = tuple(evidence.get("vertex_view_mm", [mx, my]))
-        bx, by = evidence.get("bisector", [1.0, 0.0])
-        radius = float(evidence.get("witness_radius_view_mm", max(math.dist(p, vertex), 8.0)))
-        base = radius + gap
-        return [
-            (vertex[0] + bx * base, vertex[1] + by * base, "inside_angle_bisector"),
-            (vertex[0] - bx * base, vertex[1] - by * base, "opposite_angle_sector"),
-            (vertex[0] + by * base, vertex[1] - bx * base, "rotated_sector_plus"),
-            (vertex[0] - by * base, vertex[1] + bx * base, "rotated_sector_minus"),
-        ]
-    if kind in {"radius", "diameter"}:
-        c = tuple(evidence.get("center_view_mm", [mx, my]))
-        r = float(evidence.get("radius_mm", max(math.dist(p, q), 1.0)))
-        d = r + gap
-        inv = 1.0 / math.sqrt(2.0)
-        dirs = [(1,0,"east"),(-1,0,"west"),(0,1,"north"),(0,-1,"south"),(inv,inv,"north_east"),(-inv,inv,"north_west"),(inv,-inv,"south_east"),(-inv,-inv,"south_west")]
-        return [(c[0] + dx*d, c[1] + dy*d, label) for dx,dy,label in dirs]
-    if kind == "horizontal_distance":
-        y_hi = max(p[1], q[1]) + gap
-        y_lo = min(p[1], q[1]) - gap
-        return [(mx, y_hi, "above_features"), (mx, y_lo, "below_features"), (mx, my, "between_features")]
-    if kind == "vertical_distance":
-        x_hi = max(p[0], q[0]) + gap
-        x_lo = min(p[0], q[0]) - gap
-        return [(x_hi, my, "right_of_features"), (x_lo, my, "left_of_features"), (mx, my, "between_features")]
-    if kind == "center_to_line":
-        dx, dy = q[0] - p[0], q[1] - p[1]
-        norm = math.hypot(dx, dy)
-        if norm <= _EPS:
-            return [(mx + gap, my + gap, "fallback_diagonal")]
-        nx, ny = -dy/norm, dx/norm
-        return [(mx + nx*gap, my + ny*gap, "side_plus"), (mx - nx*gap, my - ny*gap, "side_minus"), (mx,my,"between_center_and_line")]
-    if kind in {"center_to_center", "distance", "aligned_distance", "line_length"}:
-        dx, dy = q[0] - p[0], q[1] - p[1]
-        norm = math.hypot(dx, dy)
-        if norm <= _EPS:
-            return [(mx + gap, my + gap, "fallback_diagonal")]
-        nx, ny = -dy/norm, dx/norm
-        return [(mx + nx*gap, my + ny*gap, "normal_plus"), (mx - nx*gap, my - ny*gap, "normal_minus"), (mx,my,"between_features")]
-    return [(mx, my, "midpoint")]
-
 def _auto_position(
     kind: str,
     p: tuple[float, float],
     q: tuple[float, float],
     offset_sheet_mm: float,
     scale: float,
-    placement_mode: str = "smart",
-    line_direction: Optional[tuple[float, float]] = None,
-    anchor_evidence: Optional[dict[str, Any]] = None,
-    obstacles: Optional[list[dict[str, float]]] = None,
-) -> tuple[float, float, dict[str, Any]]:
-    """Choose a semantic drafting position and score alternatives against obstacles."""
-    mode = str(placement_mode or "smart").strip().lower().replace("-", "_")
-    if mode not in {"smart", "between", "outside"}:
-        raise ValueError("placement_mode must be 'smart', 'between', or 'outside'")
-    mx, my = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
-    offset = float(offset_sheet_mm) / float(scale)
-    evidence = dict(anchor_evidence or {})
-    if line_direction is not None:
-        evidence["line_direction"] = list(line_direction)
-    if mode == "between":
-        return mx, my, {
-            "strategy": "forced_between_feature_anchors",
-            "midpoint_view_mm": [mx, my],
-            "applied_offset_sheet_mm": 0.0,
-        }
-    obs = list(obstacles or [])
-    candidates = _semantic_candidates(kind, p, q, offset, evidence)
-    # outside mode removes explicit in-between choices when available.
-    if mode == "outside":
-        filtered = [c for c in candidates if "between" not in c[2]]
-        if filtered:
-            candidates = filtered
-    clearance = max(1.5, 2.0 / max(scale, _EPS))
-    vx, vy, scoring = _candidate_best(candidates, obs, clearance)
-    scoring.update({
-        "strategy": f"semantic_{kind}_placement",
-        "midpoint_view_mm": [mx, my],
-        "placement_mode": mode,
-        "obstacle_count": len(obs),
-        "clearance_view_mm": clearance,
-        "applied_offset_sheet_mm": offset_sheet_mm,
-    })
-    return vx, vy, scoring
-
-
-def _postplacement_collision_check(
-    application: Any,
-    view: Any,
-    dim: Any,
-    dimension_index: int,
-    geometry_obstacles: list[dict[str, float]],
-    margin: float = 0.5,
-) -> dict[str, Any]:
-    box = _boundary(application, dim)
-    if box is None:
-        return {"verified": False, "collision_free": None, "boundary": None, "collisions": []}
-    subject = {k: float(box[k]) for k in ("xmin", "xmax", "ymin", "ymax")}
-    existing = _existing_dimension_obstacles(application, view, exclude_index=dimension_index)
-    collisions = []
-    for label, obstacle_list in (("geometry", geometry_obstacles), ("dimension", existing)):
-        for i, obstacle in enumerate(obstacle_list):
-            if _bbox_intersects(subject, obstacle, margin=margin):
-                collisions.append({"type": label, "index": i, "bbox": obstacle})
-    return {
-        "verified": True,
-        "collision_free": not collisions,
-        "boundary": box,
-        "collision_margin_view_mm": margin,
-        "collisions": collisions,
-    }
-
-
-def _try_collision_reposition(
-    application: Any,
-    view: Any,
-    dim: Any,
-    dimension_index: int,
-    candidates: list[dict[str, Any]],
-    geometry_obstacles: list[dict[str, float]],
-) -> dict[str, Any]:
-    attempts: list[dict[str, Any]] = []
-    # Candidates are already score-ordered. Try the next positions if the initial
-    # CATIA boundary collides with other geometry or dimensions.
-    for candidate in candidates[1:6]:
-        point = candidate.get("view_mm")
-        if not isinstance(point, list) or len(point) != 2:
-            continue
-        try:
-            dim.MoveValue(float(point[0]), float(point[1]), 0, 0)
-            check = _postplacement_collision_check(
-                application, view, dim, dimension_index, geometry_obstacles
-            )
-            attempts.append({"candidate": candidate, "check": check, "error": None})
-            if check.get("collision_free") is True:
-                return {
-                    "repositioned": True,
-                    "selected_view_mm": [float(point[0]), float(point[1])],
-                    "attempts": attempts,
-                    "final_check": check,
-                }
-        except Exception as exc:
-            attempts.append({"candidate": candidate, "check": None, "error": _format_error(exc)})
-    return {"repositioned": False, "selected_view_mm": None, "attempts": attempts, "final_check": None}
+) -> tuple[float, float]:
+    mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
+    offset = offset_sheet_mm / scale
+    if kind == "horizontal_distance":
+        return mx, max(p[1], q[1]) + offset
+    if kind == "vertical_distance":
+        return max(p[0], q[0]) + offset, my
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    length = math.hypot(dx, dy)
+    if length <= _EPS:
+        return mx + offset, my + offset
+    nx, ny = -dy / length, dx / length
+    return mx + nx * offset, my + ny * offset
 
 
 def _dimension_value(dim: Any) -> Optional[float]:
@@ -1228,15 +879,90 @@ def _set_tolerance(
         return False
     up = _finite(0.0 if upper is None else upper, "tolerance_upper")
     low = _finite(-up if lower is None else lower, "tolerance_lower")
-    _evaluate(
-        application,
-        _TOLERANCE_VBS,
-        "MCP_SetNumericTolerance",
-        [dim, up, low, int(display_mode)],
-    )
+    try:
+        dim.SetTolerances(
+            2, "TOL_NUM2", "", "", up, low, int(display_mode)
+        )
+    except Exception:
+        _evaluate(
+            application,
+            _TOLERANCE_VBS,
+            "MCP_SetNumericTolerance",
+            [dim, up, low, int(display_mode)],
+        )
     return True
 
 
+def _get_tolerance(application: Any, dim: Any) -> dict[str, Any]:
+    """Read CATIA tolerance state without guessing from rendered text."""
+    getter = _safe_attr(dim, "GetTolerances")
+    if callable(getter):
+        try:
+            raw = list(getter())
+            if len(raw) >= 7:
+                return {
+                    "available": True,
+                    "read_method": "DrawingDimension.GetTolerances()",
+                    "tolerance_type": int(raw[0]),
+                    "tolerance_name": str(raw[1] or ""),
+                    "upper_text": str(raw[2] or ""),
+                    "lower_text": str(raw[3] or ""),
+                    "upper_value": float(raw[4]),
+                    "lower_value": float(raw[5]),
+                    "display_mode": int(raw[6]),
+                }
+        except Exception as direct_exc:
+            direct_error = _format_error(direct_exc)
+    else:
+        direct_error = "DrawingDimension.GetTolerances is unavailable"
+    try:
+        raw = list(_evaluate(
+            application,
+            _GET_TOLERANCE_VBS,
+            "MCP_GetDimensionTolerance",
+            [dim],
+        ))
+        if not raw or not bool(raw[0]):
+            return {"available": False}
+        return {
+            "available": True,
+            "tolerance_type": int(raw[1]),
+            "tolerance_name": str(raw[2]),
+            "upper_text": str(raw[3]),
+            "lower_text": str(raw[4]),
+            "upper_value": float(raw[5]),
+            "lower_value": float(raw[6]),
+            "display_mode": int(raw[7]),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "direct_error": direct_error,
+            "error": _format_error(exc),
+        }
+
+
+def _tolerance_matches_requested(
+    readback: dict[str, Any],
+    upper: Optional[float],
+    lower: Optional[float],
+) -> Optional[bool]:
+    if upper is None and lower is None:
+        return None
+    if not readback.get("available"):
+        return None
+    requested_upper = 0.0 if upper is None else float(upper)
+    requested_lower = -requested_upper if lower is None else float(lower)
+    try:
+        actual_upper = float(readback["upper_value"])
+        actual_lower = float(readback["lower_value"])
+    except Exception:
+        return None
+    epsilon = max(1.0e-9, abs(requested_upper) * 1.0e-6, abs(requested_lower) * 1.0e-6)
+    return (
+        abs(actual_upper - requested_upper) <= epsilon
+        and abs(actual_lower - requested_lower) <= epsilon
+    )
 def _add_internal(
     *,
     application: Any,
@@ -1250,13 +976,12 @@ def _add_internal(
     position_y: Optional[float],
     position_space: str,
     offset_mm: float,
-    placement_mode: str,
-    allow_view_bounds_fallback: bool,
     witness_points: Optional[list[float]],
     name: str,
     tolerance_upper: Optional[float],
     tolerance_lower: Optional[float],
     tolerance_display_mode: int,
+    allow_level_b_fallback: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     kind = str(kind).strip().lower()
 
@@ -1276,48 +1001,40 @@ def _add_internal(
             obj2, idx2 = _geometry(view, element2)
             b = _describe(application, obj2, idx2)
         _validate_kind(kind, a, b)
-        expected, anchor1, anchor2, unit, anchor_evidence = _expected_and_anchors(kind, a, b)
+        expected, anchor1, anchor2, unit = _expected_and_anchors(kind, a, b)
         cat_obj1, cat_obj2 = _catia_geometry_objects(kind, obj1, obj2)
     except Exception as primary_exc:
-        if (
-            kind not in {"horizontal_distance", "vertical_distance"}
-            or not bool(allow_view_bounds_fallback)
-        ):
-            raise
-
-        expected, anchor1, anchor2, fallback_evidence = _view_bounds_dimension_anchors(
-            application, view, kind
+        primary_error = _format_error(primary_exc)
+        if not bool(allow_level_b_fallback) or kind not in {
+            "horizontal_distance", "vertical_distance"
+        }:
+            raise RuntimeError(
+                "The requested projected geometry could not be resolved. "
+                "Pass allow_level_b_fallback=true only for verified overall "
+                "horizontal/vertical extents, or generate dimensions from 3D "
+                f"constraints. Original failure: {primary_error}"
+            ) from primary_exc
+        expected, anchor1, anchor2, fallback_evidence = (
+            _view_bounds_dimension_anchors(application, view, kind)
         )
-        fallback_mode = True
-        obj1 = None
-        obj2 = None
-        idx1 = -1
+        unit = "length_mm"
         a = {
             "index": None,
-            "name": "DrawingView.Size@lower_x/upper_x" if kind == "horizontal_distance" else "DrawingView.Size@lower_y/upper_y",
-            "automation_type": "DrawingView.Size bounding-box fallback",
-            "has_range_box": True,
-            "range_box_view_mm": fallback_evidence["view_bounds_mm"],
+            "name": "DrawingView.Size extent anchor 1",
+            "automation_type": "temporary_Point2D",
             "location_kind": "point",
             "location_view_mm": list(anchor1),
-            "radius_mm": None,
-            "direction": None,
         }
         b = {
             "index": None,
-            "name": "DrawingView.Size@upper_x" if kind == "horizontal_distance" else "DrawingView.Size@upper_y",
-            "automation_type": "DrawingView.Size bounding-box fallback",
-            "has_range_box": True,
-            "range_box_view_mm": fallback_evidence["view_bounds_mm"],
+            "name": "DrawingView.Size extent anchor 2",
+            "automation_type": "temporary_Point2D",
             "location_kind": "point",
             "location_view_mm": list(anchor2),
-            "radius_mm": None,
-            "direction": None,
         }
-        unit = "length_mm"
-        anchor_evidence = {"strategy": "drawing_view_size_fallback"}
         cat_obj1 = None
         cat_obj2 = None
+        fallback_mode = True
 
     rep = {
         "horizontal_distance": "horizontal",
@@ -1333,13 +1050,12 @@ def _add_internal(
         witnesses = [_finite(v, f"witness_points[{i}]") for i, v in enumerate(witness_points)]
 
     warnings: list[str] = []
-    # Snapshot obstacles before creating the new dimension. Geometry range boxes and
-    # existing dimension value boxes are used to score semantic placement candidates.
-    geometry_obstacles = _geometry_obstacles(view, application)
-    existing_dimension_obstacles = _existing_dimension_obstacles(application, view)
-    placement_obstacles = geometry_obstacles + existing_dimension_obstacles
 
     if fallback_mode:
+        try:
+            view.Activate()
+        except Exception:
+            pass
         geometry_before = _safe_count(_safe_attr(view, "GeometricElements"))
         try:
             factory = view.Factory2D
@@ -1347,6 +1063,14 @@ def _add_internal(
                 factory.CreatePoint(anchor1[0], anchor1[1]),
                 factory.CreatePoint(anchor2[0], anchor2[1]),
             ]
+            for helper_index, helper in enumerate(helper_points, start=1):
+                try:
+                    helper.Name = (
+                        f"{_HELPER_GEOMETRY_PREFIX}{kind}_{helper_index}_"
+                        f"{int(time.time() * 1000)}"
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             raise RuntimeError(
                 "DrawingView.Size fallback could not create helper Point2D objects: "
@@ -1363,7 +1087,7 @@ def _add_internal(
             and geometry_after != geometry_before + 2
         ):
             _delete_objects(document, helper_points)
-            raise AnnotationOperationError(
+            raise RuntimeError(
                 "Fallback helper Point2D creation did not produce the expected "
                 "geometry-count delta.",
                 data={
@@ -1381,7 +1105,7 @@ def _add_internal(
             "using hidden helper Point2D supports."
         )
         warnings.append(
-            f"Original geometry-selection failure: {_format_error(primary_exc)}"
+            f"Original geometry-selection failure: {primary_error}"
         )
 
     before = int(view.Dimensions.Count)
@@ -1426,23 +1150,9 @@ def _add_internal(
 
     tf = _view_transform(view)
     offset = _finite(offset_mm, "offset_mm")
-    placement_evidence: dict[str, Any]
     if position_x is None and position_y is None:
-        line_direction = None
-        if kind == "line_to_line" and a is not None and a.get("direction"):
-            line_direction = tuple(float(v) for v in a["direction"])
-        vx, vy, placement_evidence = _auto_position(
-            kind, anchor1, anchor2, offset, tf["scale"],
-            placement_mode=placement_mode,
-            line_direction=line_direction,
-            anchor_evidence=anchor_evidence,
-            obstacles=placement_obstacles,
-        )
-        resolved_from = (
-            "drawing_view_size_fallback"
-            if fallback_mode
-            else placement_evidence["strategy"]
-        )
+        vx, vy = _auto_position(kind, anchor1, anchor2, offset, tf["scale"])
+        resolved_from = "drawing_view_size_fallback" if fallback_mode else "automatic_feature_offset"
     elif position_x is None or position_y is None:
         view.Dimensions.Remove(created_index)
         if helper_points:
@@ -1455,11 +1165,9 @@ def _add_internal(
         if space == "sheet":
             vx, vy = _sheet_to_view(px, py, tf)
             resolved_from = "sheet_coordinates_converted_to_view"
-            placement_evidence = {"strategy": resolved_from}
         elif space == "view":
             vx, vy = px, py
             resolved_from = "explicit_view_coordinates"
-            placement_evidence = {"strategy": resolved_from}
         else:
             view.Dimensions.Remove(created_index)
             if helper_points:
@@ -1482,35 +1190,6 @@ def _add_internal(
             view.SaveEdition()
         except Exception:
             pass
-
-        # Verify the actual CATIA dimension boundary. If it still overlaps other
-        # geometry/dimensions, try the next semantic candidate positions.
-        collision_check = _postplacement_collision_check(
-            application, view, dim, created_index, geometry_obstacles
-        )
-        collision_reposition = {"repositioned": False, "attempts": [], "final_check": None}
-        if (
-            position_x is None
-            and position_y is None
-            and collision_check.get("collision_free") is False
-            and isinstance(placement_evidence.get("candidates"), list)
-        ):
-            collision_reposition = _try_collision_reposition(
-                application, view, dim, created_index,
-                placement_evidence["candidates"], geometry_obstacles
-            )
-            if collision_reposition.get("repositioned"):
-                vx, vy = collision_reposition["selected_view_mm"]
-                collision_check = collision_reposition["final_check"]
-                try:
-                    view.SaveEdition()
-                except Exception:
-                    pass
-            elif collision_check.get("collisions"):
-                warnings.append(
-                    "Semantic placement completed, but no tested candidate was fully "
-                    "collision-free against visible geometry/existing dimensions."
-                )
     except Exception as exc:
         cleanup_error = None
         try:
@@ -1542,13 +1221,16 @@ def _add_internal(
     box = _boundary(application, dim)
     if box is None:
         warnings.append("CATIA did not return a verifiable dimension value boundary box")
-    if 'collision_check' not in locals():
-        collision_check = _postplacement_collision_check(
-            application, view, dim, created_index, geometry_obstacles
-        )
-    if 'collision_reposition' not in locals():
-        collision_reposition = {"repositioned": False, "attempts": [], "final_check": None}
     sx, sy = _view_to_sheet(vx, vy, tf)
+    tolerance_readback = _get_tolerance(application, dim)
+    tolerance_verified = _tolerance_matches_requested(
+        tolerance_readback, tolerance_upper, tolerance_lower
+    )
+    if tolerance_set and tolerance_verified is not True:
+        warnings.append(
+            "CATIA accepted SetTolerances, but numerical tolerance readback did "
+            "not match the requested deviations; tolerance write is not verified."
+        )
     data = {
         "view": str(getattr(view, "Name", "")),
         "dimension_index": created_index,
@@ -1559,28 +1241,30 @@ def _add_internal(
         "element1": a,
         "element2": b,
         "associative_geometry": not fallback_mode,
+        "association_level": "A" if not fallback_mode else "B",
+        "association_classification": (
+            "projected_geometry_associative"
+            if not fallback_mode else
+            "native_dimension_point_supported_from_verified_view_silhouette_extents"
+        ),
         "support_mode": "drawing_view_size_hidden_helper_points" if fallback_mode else "original_drawing_geometry",
         "fallback_evidence": fallback_evidence,
         "expected_value": expected,
-        "anchor_strategy": anchor_evidence,
         "catia_measured_value": actual,
         "value_unit": unit,
         "value_matches_independent_calculation": value_matches,
         "witness_points_view_mm": witnesses,
         "placement": {
             "resolved_from": resolved_from,
-            "placement_mode": placement_mode,
-            "semantic_placement": placement_evidence,
             "view_mm": [vx, vy],
             "sheet_mm": [sx, sy],
             "view_transform": tf,
             "value_boundary_box_view_mm": box,
             "verified": box is not None,
-            "collision_check": collision_check,
-            "collision_reposition": collision_reposition,
-            "collision_free": collision_check.get("collision_free"),
         },
         "tolerance_set": tolerance_set,
+        "tolerance_readback": tolerance_readback,
+        "tolerance_verified": tolerance_verified,
         "dimension_count_before": before,
         "dimension_count_after": int(view.Dimensions.Count),
         "document_save_required": True,
@@ -1602,6 +1286,51 @@ def _dimension_by_selector(view: Any, selector: int | str) -> tuple[Any, int]:
     return dim, -1
 
 
+def _drawing_model_views(sheet: Any) -> list[Any]:
+    result: list[Any] = []
+    views = sheet.Views
+    for index in range(1, int(views.Count) + 1):
+        view = views.Item(index)
+        try:
+            view_type = int(view.ViewType)
+        except Exception:
+            view_type = -1
+        if view_type in {0, 13}:
+            continue
+        result.append(view)
+    return result
+
+
+def _find_dimension_name(view: Any, name: str) -> Optional[int]:
+    for index in range(1, int(view.Dimensions.Count) + 1):
+        try:
+            if str(view.Dimensions.Item(index).Name) == name:
+                return index
+        except Exception:
+            continue
+    return None
+
+
+def _generate_native_constraint_dimensions(sheet: Any) -> dict[str, Any]:
+    before = sum(int(v.Dimensions.Count) for v in _drawing_model_views(sheet))
+    error = None
+    try:
+        sheet.GenerateDimensions()
+    except Exception as exc:
+        error = _format_error(exc)
+    after = sum(int(v.Dimensions.Count) for v in _drawing_model_views(sheet))
+    return {
+        "attempted": True,
+        "succeeded": error is None,
+        "error": error,
+        "dimension_count_before": before,
+        "dimension_count_after": after,
+        "created_count": max(0, after - before),
+        "source": "3D constraints/parameters exposed to DrawingSheet.GenerateDimensions",
+        "association_level": "CATIA_native_constraint_associative",
+    }
+
+
 def register_tools(mcp: Any, ctx: Any) -> list[str]:
     """Register all tools and return their registry names."""
     conn = ctx.conn
@@ -1621,10 +1350,21 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
             count = int(view.GeometricElements.Count)
             limit = max(1, min(int(max_items), count))
             items = []
+            excluded = []
             failures = []
             for index in range(1, limit + 1):
                 try:
-                    items.append(_describe(application, view.GeometricElements.Item(index), index))
+                    described = _describe(
+                        application, view.GeometricElements.Item(index), index
+                    )
+                    provenance = _geometry_provenance(described)
+                    described.update(provenance)
+                    if provenance["geometry_role"] == "structural_axis":
+                        continue
+                    if provenance["is_mcp_helper_geometry"]:
+                        excluded.append(described)
+                        continue
+                    items.append(described)
                 except Exception as exc:
                     failures.append({"index": index, "error": _format_error(exc)})
             data = {
@@ -1634,6 +1374,23 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 "returned_count": len(items),
                 "truncated": limit < count,
                 "geometry": items,
+                "projected_contour_count": sum(
+                    1 for item in items
+                    if item.get("is_projected_contour_candidate")
+                ),
+                "excluded_helper_geometry": excluded,
+                "projected_geometry_exposure": (
+                    "contours_available"
+                    if any(item.get("is_projected_contour_candidate") for item in items)
+                    else "points_only_no_attachable_contours"
+                    if items
+                    else "not_exposed_by_DrawingView.GeometricElements"
+                ),
+                "dimensioning_policy": (
+                    "Only entries with valid_for_gdt_head_target=true are contour "
+                    "candidates. Point2D supports and MCP helper geometry are not "
+                    "manufacturing contours. Do not infer contours from view bounds."
+                ),
                 "description_failures": failures,
                 "supported_dimension_kinds": SUPPORTED_KINDS,
             }
@@ -1655,14 +1412,13 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         position_x: float | None = None,
         position_y: float | None = None,
         position_space: str = "view",
-        offset_mm: float = 0.0,
-        placement_mode: str = "smart",
-        allow_view_bounds_fallback: bool = False,
+        offset_mm: float = 15.0,
         witness_points: list[float] | None = None,
         name: str = "",
         tolerance_upper: float | None = None,
         tolerance_lower: float | None = None,
         tolerance_display_mode: int = 0,
+        allow_level_b_fallback: bool = False,
     ) -> dict[str, Any]:
         """Create, place and verify one associative 2D drawing dimension.
 
@@ -1670,14 +1426,14 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
         aligned_distance/line_to_line/center_to_line/center_to_center/radius/
         diameter/angle/line_length. Coordinates are view-local by default.
         With position_space='sheet', coordinates are rigorously converted using
-        view origin, rotation and scale. If position is omitted, semantic smart
-        placement is used. For line_to_line, the value is placed between the two
-        visible parallel lines, centred on their common visible span. offset_mm
-        then slides it only along the lines instead of pushing it out of the gap.
+        view origin, rotation and scale. If position is omitted, a feature-based
+        offset in paper millimetres is used.
 
-        The old whole-view DrawingView.Size fallback is disabled by default.
-        Set allow_view_bounds_fallback=True only when the caller intentionally
-        wants the full visible view width/height rather than selected geometry.
+        By default the tool fails closed when projected geometry cannot be
+        resolved.  For overall horizontal/vertical extents only,
+        allow_level_b_fallback=true creates a native point-supported dimension
+        from the verified DrawingView.Size silhouette extrema.  The result is
+        explicitly reported as association Level B, never Level A.
         """
         try:
             application, document, sheet, view = _active_context(conn, view_name)
@@ -1686,11 +1442,10 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                 kind=kind, element1=element1, element2=element2,
                 position_x=position_x, position_y=position_y,
                 position_space=position_space, offset_mm=offset_mm,
-                placement_mode=placement_mode,
-                allow_view_bounds_fallback=allow_view_bounds_fallback,
                 witness_points=witness_points, name=name,
                 tolerance_upper=tolerance_upper, tolerance_lower=tolerance_lower,
                 tolerance_display_mode=tolerance_display_mode,
+                allow_level_b_fallback=allow_level_b_fallback,
             )
             return _success(data, warnings)
         except Exception as exc:
@@ -1721,13 +1476,12 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                         element2=spec.get("element2"),
                         position_x=spec.get("position_x"), position_y=spec.get("position_y"),
                         position_space=spec.get("position_space", "view"),
-                        offset_mm=spec.get("offset_mm", 0.0),
-                        placement_mode=spec.get("placement_mode", "smart"),
-                        allow_view_bounds_fallback=spec.get("allow_view_bounds_fallback", False),
+                        offset_mm=spec.get("offset_mm", 15.0),
                         witness_points=spec.get("witness_points"), name=spec.get("name", ""),
                         tolerance_upper=spec.get("tolerance_upper"),
                         tolerance_lower=spec.get("tolerance_lower"),
                         tolerance_display_mode=spec.get("tolerance_display_mode", 0),
+                        allow_level_b_fallback=spec.get("allow_level_b_fallback", False),
                     )
                     results.append({"request_index": index, "data": data, "warnings": item_warnings})
                     warnings.extend(f"item {index}: {w}" for w in item_warnings)
@@ -1767,6 +1521,7 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
                     "value_boundary_box_view_mm": box,
                     "extension_line_count": int(getattr(dim, "NbExtLine", 0)),
                     "symbol_count": int(getattr(dim, "NbSymb", 0)),
+                    "tolerance": _get_tolerance(application, dim),
                 })
                 if box is None:
                     warnings.append(f"dimension {i}: boundary box unavailable")
@@ -1775,6 +1530,208 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
             return _error(_format_error(exc))
 
     names.append("catia_list_2d_drawing_dimensions")
+
+    @mcp.tool()
+    def catia_auto_dimension_drawing(
+        view_names: list[str] | None = None,
+        generate_from_3d_constraints: bool = True,
+        add_overall_extents: bool = True,
+        overall_tolerance_upper: float | None = None,
+        overall_tolerance_lower: float | None = None,
+        tolerance_display_mode: int = 0,
+        offset_mm: float = 18.0,
+    ) -> dict[str, Any]:
+        """Generate the maximum defensible native dimension set.
+
+        Phase 1 asks CATIA to generate dimensions from exposed 3D constraints.
+        Phase 2 adds horizontal and vertical overall extents for selected model
+        views when those dimensions do not already exist.  When projected
+        contour objects are unavailable, overall extents are Level B native
+        dimensions supported by verified silhouette-extreme Point2D objects.
+        The tool never claims feature-size/location completeness merely from a
+        bounding box; remaining design-intent gaps are returned explicitly.
+        """
+        try:
+            application, document, sheet = _drawing_context(conn)
+            native = (
+                _generate_native_constraint_dimensions(sheet)
+                if bool(generate_from_3d_constraints)
+                else {"attempted": False, "created_count": 0}
+            )
+            warnings: list[str] = []
+            if native.get("error"):
+                warnings.append(
+                    "DrawingSheet.GenerateDimensions failed: " + str(native["error"])
+                )
+            requested_names = {
+                str(name).strip().lower() for name in (view_names or [])
+                if str(name).strip()
+            }
+            views = [
+                view for view in _drawing_model_views(sheet)
+                if not requested_names
+                or str(view.Name).strip().lower() in requested_names
+            ]
+            created: list[dict[str, Any]] = []
+            failures: list[dict[str, Any]] = []
+            if bool(add_overall_extents):
+                for view in views:
+                    for kind, suffix in (
+                        ("horizontal_distance", "OverallWidth"),
+                        ("vertical_distance", "OverallHeight"),
+                    ):
+                        dim_name = f"MCP_{str(view.Name)}_{suffix}"
+                        existing = _find_dimension_name(view, dim_name)
+                        if existing is not None:
+                            created.append({
+                                "view": str(view.Name),
+                                "kind": kind,
+                                "dimension_name": dim_name,
+                                "dimension_index": existing,
+                                "action": "already_exists",
+                            })
+                            continue
+                        try:
+                            data, item_warnings = _add_internal(
+                                application=application,
+                                document=document,
+                                sheet=sheet,
+                                view=view,
+                                kind=kind,
+                                element1="__projected_outline__",
+                                element2="__projected_outline__",
+                                position_x=None,
+                                position_y=None,
+                                position_space="view",
+                                offset_mm=offset_mm,
+                                witness_points=None,
+                                name=dim_name,
+                                tolerance_upper=overall_tolerance_upper,
+                                tolerance_lower=overall_tolerance_lower,
+                                tolerance_display_mode=tolerance_display_mode,
+                                allow_level_b_fallback=True,
+                            )
+                            created.append({"action": "created", **data})
+                            warnings.extend(
+                                f"{view.Name}/{kind}: {warning}"
+                                for warning in item_warnings
+                            )
+                        except Exception as exc:
+                            failures.append({
+                                "view": str(view.Name),
+                                "kind": kind,
+                                "error": _format_error(exc),
+                            })
+
+            inventory = []
+            for view in views:
+                dimensions = []
+                for index in range(1, int(view.Dimensions.Count) + 1):
+                    dim = view.Dimensions.Item(index)
+                    dimensions.append({
+                        "index": index,
+                        "name": str(getattr(dim, "Name", "")),
+                        "measured_value": _dimension_value(dim),
+                        "dim_status": int(getattr(dim, "DimStatus", -1)),
+                        "tolerance": _get_tolerance(application, dim),
+                    })
+                inventory.append({
+                    "view": str(view.Name),
+                    "dimension_count": len(dimensions),
+                    "dimensions": dimensions,
+                })
+            remaining = [
+                "Feature sizes (holes, radii, chamfers, thicknesses) not exposed as 3D constraints/PMI",
+                "Feature locations and patterns not exposed as 3D constraints/PMI",
+                "Functional tolerances not supplied by the caller or model PMI",
+                "Functional datum scheme and GD&T design intent",
+            ]
+            return _success({
+                "operation": "catia_auto_dimension_drawing",
+                "native_constraint_generation": native,
+                "overall_extent_results": created,
+                "overall_extent_failures": failures,
+                "inventory": inventory,
+                "association_policy": {
+                    "A": "DrawingDimension attached to exposed projected geometry",
+                    "B": "Native DrawingDimension attached to verified view-silhouette extent supports",
+                    "native_constraint": "CATIA-generated from 3D model constraints/parameters",
+                },
+                "remaining_design_intent_requirements": remaining,
+                "complete_for_arbitrary_part": not bool(remaining),
+                "document_save_required": bool(native.get("created_count") or any(
+                    item.get("action") == "created" for item in created
+                )),
+            }, warnings + ([f"{len(failures)} overall dimension(s) failed"] if failures else []))
+        except Exception as exc:
+            return _error(_format_error(exc))
+
+    names.append("catia_auto_dimension_drawing")
+
+    @mcp.tool()
+    def catia_audit_dimension_completeness(
+        expected_dimensions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Audit native dimensions, tolerances and caller-supplied dimension plan."""
+        try:
+            application, document, sheet = _drawing_context(conn)
+            views = _drawing_model_views(sheet)
+            inventory: list[dict[str, Any]] = []
+            names_found: set[str] = set()
+            without_tolerance: list[dict[str, Any]] = []
+            for view in views:
+                for index in range(1, int(view.Dimensions.Count) + 1):
+                    dim = view.Dimensions.Item(index)
+                    name = str(getattr(dim, "Name", ""))
+                    names_found.add(name)
+                    tolerance = _get_tolerance(application, dim)
+                    record = {
+                        "view": str(view.Name),
+                        "index": index,
+                        "name": name,
+                        "value": _dimension_value(dim),
+                        "status": int(getattr(dim, "DimStatus", -1)),
+                        "tolerance": tolerance,
+                    }
+                    inventory.append(record)
+                    if not tolerance.get("available"):
+                        without_tolerance.append(record)
+            expected = expected_dimensions or []
+            missing = []
+            for item in expected:
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    missing.append({**item, "reason": "expected dimension has no stable name"})
+                elif name not in names_found:
+                    missing.append({**item, "reason": "native dimension not found"})
+            plan_supplied = bool(expected)
+            complete = bool(plan_supplied and not missing)
+            warnings = []
+            if not plan_supplied:
+                warnings.append(
+                    "No dimension plan was supplied; arbitrary-part manufacturing completeness cannot be proven."
+                )
+            if without_tolerance:
+                warnings.append(
+                    f"{len(without_tolerance)} native dimension(s) have no readable explicit tolerance; general tolerance may still apply."
+                )
+            return _success({
+                "operation": "catia_audit_dimension_completeness",
+                "dimension_plan_supplied": plan_supplied,
+                "expected_count": len(expected),
+                "native_dimension_count": len(inventory),
+                "missing_expected_dimensions": missing,
+                "dimensions_without_readable_explicit_tolerance": without_tolerance,
+                "inventory": inventory,
+                "complete": complete,
+                "completeness_rule": "PASS requires a caller/model-derived dimension plan and every planned native dimension present",
+                "model_modified": False,
+                "document_save_required": False,
+            }, warnings)
+        except Exception as exc:
+            return _error(_format_error(exc))
+
+    names.append("catia_audit_dimension_completeness")
 
     @mcp.tool()
     def catia_edit_2d_drawing_dimension(

@@ -1,6 +1,6 @@
 """
 drafting.py
-Version: drafting-fixed-2026-08-03-v7
+Version: drafting-fixed-2026-08-06-v8
 
 CATIA V5 MCP generative drafting tools.
 
@@ -70,7 +70,7 @@ from typing import Any, Optional
 from catia_mcp.connection import CATIAError, normalize_path, safe_str
 
 
-IMPLEMENTATION_VERSION = "drafting-fixed-2026-08-03-v7"
+IMPLEMENTATION_VERSION = "drafting-fixed-2026-08-06-v8"
 _CATVB_SCRIPT_LANGUAGE = 1
 
 PAPER_SIZE_ENUM = {
@@ -4512,6 +4512,606 @@ def _create_3view_drawing_from_model_doc(
         ) from exc
 
 
+
+# ---------------------------------------------------------------------------
+# Existing-template three-view integration (v8)
+# ---------------------------------------------------------------------------
+
+def _projection_method_from_existing_sheet(
+    sheet: Any,
+) -> dict[str, Any]:
+    """Read the existing sheet projection without mutating template settings."""
+    code = int(sheet.ProjectionMethod)
+    mapping = {
+        0: "first_angle",
+        1: "third_angle",
+    }
+    method = mapping.get(code)
+    if method is None:
+        raise DraftingOperationError(
+            "The active template sheet projection method could not be "
+            f"classified (ProjectionMethod={code}).",
+            data={
+                "projection_method_code": code,
+                "model_modified": False,
+                "document_save_required": False,
+            },
+        )
+    return {
+        "actual_code": code,
+        "method": method,
+        "verified": True,
+        "read_method": "DrawingSheet.ProjectionMethod",
+        "mutated": False,
+    }
+
+
+def _delete_drawing_view(
+    drawing_document: Any,
+    sheet: Any,
+    view: Any,
+) -> dict[str, Any]:
+    """Delete one added non-system DrawingView and verify the count delta."""
+    before_count = int(sheet.Views.Count)
+    selection = drawing_document.Selection
+    attempts: list[dict[str, Any]] = []
+
+    try:
+        selection.Clear()
+        selection.Add(view)
+        selection.Delete()
+        selection.Clear()
+        after_count = int(sheet.Views.Count)
+        verified = after_count == before_count - 1
+        attempts.append({
+            "method": "DrawingDocument.Selection.Delete",
+            "succeeded": True,
+            "views_count_before": before_count,
+            "views_count_after": after_count,
+            "verified": verified,
+            "error": None,
+        })
+        if verified:
+            return {
+                "attempted": True,
+                "succeeded": True,
+                "selected_method": attempts[-1]["method"],
+                "attempts": attempts,
+            }
+    except Exception as exc:
+        try:
+            selection.Clear()
+        except Exception:
+            pass
+        attempts.append({
+            "method": "DrawingDocument.Selection.Delete",
+            "succeeded": False,
+            "verified": False,
+            "error": _format_com_error(exc),
+        })
+
+    name = safe_str(_safe_attribute(view, "Name", "")).strip()
+    for key in (name or None, before_count):
+        if key is None:
+            continue
+        try:
+            count_before = int(sheet.Views.Count)
+            sheet.Views.Remove(key)
+            count_after = int(sheet.Views.Count)
+            verified = count_after == count_before - 1
+            attempts.append({
+                "method": f"DrawingViews.Remove({key!r})",
+                "succeeded": True,
+                "views_count_before": count_before,
+                "views_count_after": count_after,
+                "verified": verified,
+                "error": None,
+            })
+            if verified:
+                return {
+                    "attempted": True,
+                    "succeeded": True,
+                    "selected_method": attempts[-1]["method"],
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({
+                "method": f"DrawingViews.Remove({key!r})",
+                "succeeded": False,
+                "verified": False,
+                "error": _format_com_error(exc),
+            })
+
+    return {
+        "attempted": True,
+        "succeeded": False,
+        "selected_method": None,
+        "attempts": attempts,
+    }
+
+
+def _rollback_added_drawing_views(
+    drawing_document: Any,
+    sheet: Any,
+    baseline_view_count: int,
+    created_views: list[Any],
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for view in reversed(created_views):
+        results.append(
+            _delete_drawing_view(
+                drawing_document,
+                sheet,
+                view,
+            )
+        )
+
+    update_attempts, update_warnings = _call_update(
+        sheet,
+        drawing_document,
+    )
+    final_count = int(sheet.Views.Count)
+    verified = bool(
+        final_count == int(baseline_view_count)
+        and all(item["succeeded"] for item in results)
+    )
+    return {
+        "attempted": bool(created_views),
+        "created_view_count": len(created_views),
+        "results": results,
+        "views_count_expected": int(baseline_view_count),
+        "views_count_actual": final_count,
+        "update_attempts": update_attempts,
+        "warnings": update_warnings,
+        "rollback_verified": verified,
+    }
+
+
+def _resolve_existing_drawing_document(
+    conn: Any,
+    application: Any,
+    drawing_path: str,
+) -> tuple[Any, dict[str, Any]]:
+    raw = str(drawing_path or "").strip()
+    if not raw:
+        document = _require_active_drawing_document(conn)
+        return document, {
+            "selection_method": "active_CATDrawing",
+            "path": _document_full_name(document),
+            "opened_by_tool": False,
+        }
+
+    normalized = str(normalize_path(raw))
+    if not normalized.lower().endswith(".catdrawing"):
+        raise ValueError("drawing_path must point to a .CATDrawing file.")
+    if not os.path.isfile(normalized):
+        raise FileNotFoundError(
+            f"Target template CATDrawing was not found: {normalized}"
+        )
+
+    document = _find_open_document_by_path(
+        application,
+        normalized,
+    )
+    opened_by_tool = document is None
+    if document is None:
+        document = application.Documents.Open(normalized)
+
+    try:
+        _ = int(document.Sheets.Count)
+    except Exception as exc:
+        if opened_by_tool:
+            _close_document(document)
+        raise CATIAError(
+            f"Target document is not a CATDrawing: {normalized}"
+        ) from exc
+
+    return document, {
+        "selection_method": (
+            "opened_by_path" if opened_by_tool
+            else "already_open_by_path"
+        ),
+        "path": normalized,
+        "opened_by_tool": opened_by_tool,
+    }
+
+
+def _add_3view_to_existing_drawing_doc(
+    conn: Any,
+    application: Any,
+    drawing_document: Any,
+    model_document: Any,
+    scale: float,
+    generate_dimensions: bool,
+    minimum_view_gap_mm: float,
+    sheet_margin_mm: float,
+    require_empty_model_views: bool,
+    save_after_add: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Add Front/Top/Right to an existing template CATDrawing.
+
+    This operation deliberately does not create, replace or sanitise the
+    CATDrawing file. On failure it rolls back only the newly added views.
+    """
+    warnings: list[str] = []
+    created_views: list[Any] = []
+
+    scale_value = _positive_float(scale, "scale")
+    minimum_gap_value = _positive_float(
+        minimum_view_gap_mm,
+        "minimum_view_gap_mm",
+    )
+    sheet_margin_value = _positive_float(
+        sheet_margin_mm,
+        "sheet_margin_mm",
+    )
+    if not isinstance(require_empty_model_views, bool):
+        raise ValueError(
+            "require_empty_model_views must be a boolean."
+        )
+    if not isinstance(save_after_add, bool):
+        raise ValueError("save_after_add must be a boolean.")
+
+    model_info = conn.describe_document(model_document)
+    if model_info.get("kind") not in ("CATPart", "CATProduct"):
+        raise CATIAError(
+            "model_path must resolve to a CATPart or CATProduct."
+        )
+
+    try:
+        _ = int(drawing_document.Sheets.Count)
+    except Exception as exc:
+        raise CATIAError(
+            "Target document must be an existing CATDrawing."
+        ) from exc
+
+    drawing_document.Activate()
+    sheet = drawing_document.Sheets.ActiveSheet
+    views_before = int(sheet.Views.Count)
+    existing_non_system_views = max(0, views_before - 2)
+    if require_empty_model_views and existing_non_system_views != 0:
+        raise DraftingOperationError(
+            "The template drawing already contains non-system views. "
+            "No new view was created.",
+            data={
+                "views_count_before": views_before,
+                "existing_non_system_view_count": (
+                    existing_non_system_views
+                ),
+                "require_empty_model_views": True,
+                "model_modified": False,
+                "document_save_required": False,
+            },
+        )
+
+    projection = _projection_method_from_existing_sheet(sheet)
+    paper_dimensions = _get_paper_dimensions(
+        application,
+        sheet,
+    )
+    layout = _calculate_layout(
+        paper_dimensions["width_mm"],
+        paper_dimensions["height_mm"],
+        projection["method"],
+    )
+    represented_object = _represented_3d_object(
+        model_document
+    )
+
+    try:
+        front_view = _add_front_view(
+            sheet,
+            model_document,
+            represented_object,
+            layout,
+            scale_value,
+        )
+        created_views.append(front_view)
+
+        top_view = _add_projected_view(
+            application,
+            sheet,
+            front_view,
+            model_document,
+            represented_object,
+            "Top view",
+            "top",
+            layout.top_x,
+            layout.top_y,
+            scale_value,
+        )
+        created_views.append(top_view)
+
+        right_view = _add_projected_view(
+            application,
+            sheet,
+            front_view,
+            model_document,
+            represented_object,
+            "Right view",
+            "right",
+            layout.right_x,
+            layout.right_y,
+            scale_value,
+        )
+        created_views.append(right_view)
+
+        update_attempts, update_warnings = _call_update(
+            sheet,
+            drawing_document,
+        )
+        warnings.extend(update_warnings)
+
+        view_generation_waits = {
+            "front": _wait_for_view_generation(
+                application,
+                drawing_document,
+                sheet,
+                front_view,
+            ),
+            "top": _wait_for_view_generation(
+                application,
+                drawing_document,
+                sheet,
+                top_view,
+                position_callback=lambda: (
+                    _position_projected_view(
+                        application,
+                        top_view,
+                        front_view,
+                        "top",
+                        layout.top_x,
+                        layout.top_y,
+                    )
+                ),
+            ),
+            "right": _wait_for_view_generation(
+                application,
+                drawing_document,
+                sheet,
+                right_view,
+                position_callback=lambda: (
+                    _position_projected_view(
+                        application,
+                        right_view,
+                        front_view,
+                        "right",
+                        layout.right_x,
+                        layout.right_y,
+                    )
+                ),
+            ),
+        }
+
+        layout_resolution = _resolve_three_view_overlap(
+            application,
+            drawing_document,
+            sheet,
+            front_view,
+            top_view,
+            right_view,
+            projection["method"],
+            minimum_gap_value,
+            paper_dimensions["width_mm"],
+            paper_dimensions["height_mm"],
+            sheet_margin_value,
+        )
+
+        views_after = int(sheet.Views.Count)
+        view_summaries = [
+            _view_summary(
+                application,
+                front_view,
+                expected_type="front",
+            ),
+            _view_summary(
+                application,
+                top_view,
+                expected_type="top",
+            ),
+            _view_summary(
+                application,
+                right_view,
+                expected_type="right",
+            ),
+        ]
+        view_verification = _verify_three_views(
+            view_summaries
+        )
+        generation_waits_verified = all(
+            item["verified"]
+            for item in view_generation_waits.values()
+        )
+        creation_verified = bool(
+            views_after == views_before + 3
+            and view_verification["all_views_verified"]
+            and generation_waits_verified
+            and layout_resolution["verified"]
+        )
+        if not creation_verified:
+            raise DraftingOperationError(
+                "Three views were added to the template drawing, but "
+                "their generation or layout could not be fully verified.",
+                data={
+                    "views_count_before": views_before,
+                    "views_count_after": views_after,
+                    "views": view_summaries,
+                    "view_verification": view_verification,
+                    "view_generation_waits": (
+                        view_generation_waits
+                    ),
+                    "layout_resolution": layout_resolution,
+                },
+            )
+
+        dimension_generation = {
+            "requested": bool(generate_dimensions),
+            "generation_call_succeeded": False,
+            "generated": False,
+            "generated_count": 0,
+        }
+        if generate_dimensions:
+            (
+                dimension_generation,
+                dimension_warnings,
+            ) = _generate_dimensions_internal(
+                sheet,
+                drawing_document,
+            )
+            dimension_generation["requested"] = True
+            warnings.extend(dimension_warnings)
+
+        final_update_attempts, final_update_warnings = _call_update(
+            sheet,
+            drawing_document,
+        )
+        warnings.extend(final_update_warnings)
+
+        save_result = {
+            "requested": bool(save_after_add),
+            "attempted": False,
+            "succeeded": None,
+            "document_saved": _document_saved(
+                drawing_document
+            ),
+            "error": None,
+        }
+        if save_after_add:
+            save_result["attempted"] = True
+            try:
+                drawing_document.Save()
+                saved = _document_saved(
+                    drawing_document
+                ) is True
+                save_result["succeeded"] = saved
+                save_result["document_saved"] = saved
+                if not saved:
+                    raise RuntimeError(
+                        "DrawingDocument.Save returned without Saved=true."
+                    )
+            except Exception as exc:
+                save_result["succeeded"] = False
+                save_result["error"] = _format_com_error(exc)
+                raise DraftingOperationError(
+                    "Views were created, but the existing template "
+                    "CATDrawing could not be saved.",
+                    data={
+                        "save_result": save_result,
+                        "views_count_before": views_before,
+                        "views_count_after": int(
+                            sheet.Views.Count
+                        ),
+                    },
+                ) from exc
+
+        return {
+            "operation": (
+                "catia_add_3view_to_existing_drawing"
+            ),
+            "created": True,
+            "creation_verified": True,
+            "integration_mode": (
+                "existing_template_drawing_in_place"
+            ),
+            "drawing_recreated": False,
+            "template_sanitisation_called": False,
+            "sheet_settings_mutated": False,
+            "model_document": model_info,
+            "drawing": _drawing_summary(
+                conn,
+                application,
+                drawing_document,
+            ),
+            "sheet_projection": projection,
+            "paper_dimensions": paper_dimensions,
+            "scale": scale_value,
+            "layout": {
+                "front": [layout.front_x, layout.front_y],
+                "top": [layout.top_x, layout.top_y],
+                "right": [layout.right_x, layout.right_y],
+                "layout_basis": (
+                    "existing template paper size and "
+                    "projection method"
+                ),
+            },
+            "views_count_before": views_before,
+            "views_count_after": int(sheet.Views.Count),
+            "views_added_count": 3,
+            "views": view_summaries,
+            "view_verification": view_verification,
+            "view_generation_waits": (
+                view_generation_waits
+            ),
+            "layout_resolution": layout_resolution,
+            "dimension_generation": dimension_generation,
+            "update_attempts": update_attempts,
+            "final_update_attempts": (
+                final_update_attempts
+            ),
+            "save_result": save_result,
+            "rollback": {
+                "attempted": False,
+                "rollback_verified": True,
+            },
+            "model_modified": True,
+            "document_save_required": (
+                not bool(save_after_add)
+            ),
+        }, warnings
+
+    except Exception as exc:
+        rollback = _rollback_added_drawing_views(
+            drawing_document,
+            sheet,
+            views_before,
+            created_views,
+        )
+        warnings.extend(rollback.get("warnings", []))
+        data = dict(
+            getattr(exc, "data", None) or {}
+        )
+        data.update({
+            "operation": (
+                "catia_add_3view_to_existing_drawing"
+            ),
+            "integration_mode": (
+                "existing_template_drawing_in_place"
+            ),
+            "views_count_before": views_before,
+            "created_view_count_before_failure": len(
+                created_views
+            ),
+            "rollback": rollback,
+            "drawing_file_replaced": False,
+            "template_sanitisation_called": False,
+            "model_modified": not rollback[
+                "rollback_verified"
+            ],
+            "document_save_required": not rollback[
+                "rollback_verified"
+            ],
+        })
+        status = (
+            "error"
+            if rollback["rollback_verified"]
+            else "partial_success"
+        )
+        if isinstance(exc, DraftingOperationError):
+            raise DraftingOperationError(
+                str(exc),
+                data=data,
+                warnings=[*warnings, *exc.warnings],
+                status=status,
+            ) from exc
+        raise DraftingOperationError(
+            _format_com_error(exc),
+            data=data,
+            warnings=warnings,
+            status=status,
+        ) from exc
+
+
+
 # ---------------------------------------------------------------------------
 # MCP registration
 # ---------------------------------------------------------------------------
@@ -4713,6 +5313,138 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
             return _error(_format_com_error(exc))
 
     names.append("catia_create_3view_drawing_from_active_model")
+
+    @mcp.tool()
+    def catia_add_3view_to_existing_drawing(
+        model_path: str,
+        drawing_path: str = "",
+        scale: float = 0.5,
+        generate_dimensions: bool = False,
+        minimum_view_gap_mm: float = 20.0,
+        sheet_margin_mm: float = 15.0,
+        require_empty_model_views: bool = True,
+        save_after_add: bool = True,
+    ) -> dict[str, Any]:
+        """Add verified Front/Top/Right views to an existing template drawing.
+
+        Unlike catia_create_3view_drawing_from_file, this tool never creates a
+        blank Drawing document and never reapplies or sanitises the template.
+        It reads the target sheet's existing paper size and projection method.
+        On failure, only views created by this call are rolled back.
+        """
+        model_document = None
+        drawing_document = None
+        model_opened_by_tool = False
+        drawing_lifecycle: dict[str, Any] = {}
+        normalized_model_path: Optional[str] = None
+
+        try:
+            application = conn.connect(visible=True)
+            drawing_document, drawing_lifecycle = (
+                _resolve_existing_drawing_document(
+                    conn,
+                    application,
+                    drawing_path,
+                )
+            )
+
+            normalized_model_path = _normalise_model_path(
+                model_path
+            )
+            model_document = _find_open_document_by_path(
+                application,
+                normalized_model_path,
+            )
+            if model_document is None:
+                model_document = application.Documents.Open(
+                    normalized_model_path
+                )
+                model_opened_by_tool = True
+
+            drawing_document.Activate()
+            data, warnings = (
+                _add_3view_to_existing_drawing_doc(
+                    conn=conn,
+                    application=application,
+                    drawing_document=drawing_document,
+                    model_document=model_document,
+                    scale=scale,
+                    generate_dimensions=bool(
+                        generate_dimensions
+                    ),
+                    minimum_view_gap_mm=(
+                        minimum_view_gap_mm
+                    ),
+                    sheet_margin_mm=sheet_margin_mm,
+                    require_empty_model_views=bool(
+                        require_empty_model_views
+                    ),
+                    save_after_add=bool(save_after_add),
+                )
+            )
+            data["drawing_document_lifecycle"] = {
+                **drawing_lifecycle,
+                "left_open_intentionally": True,
+                "reason": (
+                    "The template drawing remains open for "
+                    "annotation and export."
+                ),
+            }
+            data["source_document_lifecycle"] = {
+                "path": normalized_model_path,
+                "opened_by_tool": model_opened_by_tool,
+                "left_open_intentionally": True,
+                "reason": (
+                    "Generative views keep the source model "
+                    "loaded for update."
+                ),
+            }
+            return _success(data, warnings)
+
+        except DraftingOperationError as exc:
+            source_cleanup = None
+            if model_opened_by_tool:
+                source_cleanup = _close_document(
+                    model_document
+                )
+            data = dict(exc.data or {})
+            data["drawing_document_lifecycle"] = (
+                drawing_lifecycle
+            )
+            data["source_document_lifecycle"] = {
+                "path": normalized_model_path,
+                "opened_by_tool": model_opened_by_tool,
+                "cleanup_on_failure": source_cleanup,
+            }
+            return _error(
+                str(exc),
+                data=data,
+                warnings=exc.warnings,
+                status=exc.status,
+            )
+        except Exception as exc:
+            source_cleanup = None
+            if model_opened_by_tool:
+                source_cleanup = _close_document(
+                    model_document
+                )
+            return _error(
+                _format_com_error(exc),
+                data={
+                    "drawing_document_lifecycle": (
+                        drawing_lifecycle
+                    ),
+                    "source_document_lifecycle": {
+                        "path": normalized_model_path,
+                        "opened_by_tool": (
+                            model_opened_by_tool
+                        ),
+                        "cleanup_on_failure": source_cleanup,
+                    },
+                },
+            )
+
+    names.append("catia_add_3view_to_existing_drawing")
 
     @mcp.tool()
     def catia_generate_drawing_dimensions() -> dict[str, Any]:
