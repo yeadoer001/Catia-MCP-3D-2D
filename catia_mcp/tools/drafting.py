@@ -1,6 +1,6 @@
 """
 drafting.py
-Version: drafting-fixed-2026-08-06-v8
+Version: drafting-safe-frame-2026-08-19-v9
 
 CATIA V5 MCP generative drafting tools.
 
@@ -70,7 +70,7 @@ from typing import Any, Optional
 from catia_mcp.connection import CATIAError, normalize_path, safe_str
 
 
-IMPLEMENTATION_VERSION = "drafting-fixed-2026-08-06-v8"
+IMPLEMENTATION_VERSION = "drafting-safe-frame-2026-08-19-v9"
 _CATVB_SCRIPT_LANGUAGE = 1
 
 PAPER_SIZE_ENUM = {
@@ -112,6 +112,10 @@ TITLE_BLOCK_HEIGHT_MM = (
 )
 DEFAULT_TITLE_BLOCK_MARGIN_MM = 5.0
 DEFAULT_TITLE_BLOCK_Y_MM = 35.0
+
+# Additional keep-out band measured inward from the existing sheet-margin boundary.
+# The template/background geometry is never inspected or modified by this rule.
+INNER_FRAME_INSET_MM = 40.0
 
 STANDARD_PAPER_PORTRAIT_MM = {
     "A0": (841.0, 1189.0),
@@ -1488,23 +1492,92 @@ def _configure_sheet(
     }
 
 
+def _effective_safe_margin_mm(
+    requested_sheet_margin_mm: float,
+    inner_frame_inset_mm: float = INNER_FRAME_INSET_MM,
+) -> float:
+    requested = _positive_float(
+        requested_sheet_margin_mm, "requested_sheet_margin_mm"
+    )
+    inset = _finite_float(inner_frame_inset_mm, "inner_frame_inset_mm")
+    if inset < 0.0:
+        raise ValueError("inner_frame_inset_mm cannot be negative.")
+    return requested + inset
+
+
+def _safe_area_descriptor(
+    paper_width_mm: float,
+    paper_height_mm: float,
+    requested_sheet_margin_mm: float,
+    inner_frame_inset_mm: float = INNER_FRAME_INSET_MM,
+) -> dict[str, Any]:
+    effective = _effective_safe_margin_mm(
+        requested_sheet_margin_mm, inner_frame_inset_mm
+    )
+    xmin = effective
+    ymin = effective
+    xmax = float(paper_width_mm) - effective
+    ymax = float(paper_height_mm) - effective
+    if xmax <= xmin or ymax <= ymin:
+        raise DraftingOperationError(
+            "The requested sheet margin plus inner-frame inset leaves no usable drawing area.",
+            data={
+                "requested_sheet_margin_mm": float(requested_sheet_margin_mm),
+                "inner_frame_inset_mm": float(inner_frame_inset_mm),
+                "effective_safe_margin_mm": effective,
+                "paper_width_mm": float(paper_width_mm),
+                "paper_height_mm": float(paper_height_mm),
+            },
+        )
+    return {
+        "requested_sheet_margin_mm": float(requested_sheet_margin_mm),
+        "inner_frame_inset_mm": float(inner_frame_inset_mm),
+        "effective_safe_margin_mm": effective,
+        "xmin_mm": xmin,
+        "xmax_mm": xmax,
+        "ymin_mm": ymin,
+        "ymax_mm": ymax,
+        "width_mm": xmax - xmin,
+        "height_mm": ymax - ymin,
+        "policy": "requested_sheet_margin_plus_fixed_inner_frame_inset",
+    }
+
+
 def _calculate_layout(
     paper_width: float,
     paper_height: float,
     projection_method: str,
+    safe_margin_mm: float = 0.0,
 ) -> DrawingLayout:
-    front_x = paper_width * 0.36
-    front_y = paper_height * 0.46
+    margin = max(0.0, float(safe_margin_mm))
+    usable_width = float(paper_width) - 2.0 * margin
+    usable_height = float(paper_height) - 2.0 * margin
+    if usable_width <= 0.0 or usable_height <= 0.0:
+        raise DraftingOperationError(
+            "The effective safe margin leaves no usable area for initial layout."
+        )
+
+    def ux(fraction: float) -> float:
+        return margin + usable_width * fraction
+
+    def uy(fraction: float) -> float:
+        return margin + usable_height * fraction
+
+    # Keep the original relative layout proportions, but apply them to the safe area
+    # instead of to the full paper. Final DrawingView.Size verification still decides
+    # whether the actual generated geometry fits.
+    front_x = ux(0.36)
+    front_y = uy(0.46)
 
     if projection_method == "third_angle":
         top_x = front_x
-        top_y = paper_height * 0.76
-        right_x = paper_width * 0.70
+        top_y = uy(0.76)
+        right_x = ux(0.70)
         right_y = front_y
     else:
         top_x = front_x
-        top_y = paper_height * 0.18
-        right_x = paper_width * 0.12
+        top_y = uy(0.18)
+        right_x = ux(0.12)
         right_y = front_y
 
     return DrawingLayout(
@@ -1514,10 +1587,10 @@ def _calculate_layout(
         top_y=top_y,
         right_x=right_x,
         right_y=right_y,
-        title_block_x=max(5.0, paper_width - 95.0),
-        title_block_y=max(20.0, paper_height * 0.12),
-        notes_x=max(10.0, paper_width * 0.04),
-        notes_y=max(20.0, paper_height * 0.12),
+        title_block_x=max(margin, paper_width - margin - TITLE_BLOCK_WIDTH_MM),
+        title_block_y=max(margin, min(DEFAULT_TITLE_BLOCK_Y_MM, paper_height - margin - TITLE_BLOCK_HEIGHT_MM)),
+        notes_x=margin + 2.0,
+        notes_y=margin + 2.0,
     )
 
 
@@ -4062,6 +4135,55 @@ def _drawing_summary(
 
 
 # ---------------------------------------------------------------------------
+# Final safe-area annotation verification
+# ---------------------------------------------------------------------------
+
+def _verify_final_safe_area_annotations(
+    application: Any,
+    sheet: Any,
+    requested_sheet_margin_mm: float,
+    *,
+    attempt_repair: bool = True,
+) -> dict[str, Any]:
+    """Verify view geometry plus view-local dimensions/text against one sheet safe area.
+
+    The implementation lives in smart_annotation_layout so exact dimension
+    GetBoundaryBox handling and local-to-sheet coordinate conversion have one owner.
+    System/background template views are excluded, so the template itself is never
+    moved, rewritten or treated as an annotation that must be repaired.
+    """
+    try:
+        from catia_mcp.tools.smart_annotation_layout import (
+            verify_annotations_within_sheet_safe_area,
+        )
+    except Exception as exc:
+        raise DraftingOperationError(
+            "Safe-area annotation verification is unavailable: "
+            f"{_format_com_error(exc)}"
+        ) from exc
+
+    result = verify_annotations_within_sheet_safe_area(
+        application,
+        sheet_index=None,
+        requested_sheet_margin_mm=float(requested_sheet_margin_mm),
+        inner_frame_inset_mm=INNER_FRAME_INSET_MM,
+        include_dimensions=True,
+        include_texts=True,
+        include_view_geometry=True,
+        attempt_repair=bool(attempt_repair),
+        strict_readback=True,
+        exclude_system_views=True,
+    )
+    if not result.get("ok", False):
+        raise DraftingOperationError(
+            "Views or annotations cross the configured inner-frame safety area.",
+            data={"final_safe_area_verification": result},
+            warnings=list(result.get("warnings", [])),
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core three-view creation
 # ---------------------------------------------------------------------------
 
@@ -4144,10 +4266,17 @@ def _create_3view_drawing_from_model_doc(
         paper_dimensions = sheet_configuration[
             "paper_dimensions"
         ]
+        safe_area = _safe_area_descriptor(
+            paper_dimensions["width_mm"],
+            paper_dimensions["height_mm"],
+            sheet_margin_value,
+        )
+        effective_safe_margin = safe_area["effective_safe_margin_mm"]
         layout = _calculate_layout(
             paper_dimensions["width_mm"],
             paper_dimensions["height_mm"],
             projection_name,
+            effective_safe_margin,
         )
 
         views_before = int(sheet.Views.Count)
@@ -4242,7 +4371,7 @@ def _create_3view_drawing_from_model_doc(
             minimum_gap_value,
             paper_dimensions["width_mm"],
             paper_dimensions["height_mm"],
-            sheet_margin_value,
+            effective_safe_margin,
         )
 
         views_after = int(sheet.Views.Count)
@@ -4337,7 +4466,7 @@ def _create_3view_drawing_from_model_doc(
                 "CATIA MCP",
                 layout.title_block_x,
                 layout.title_block_y,
-                sheet_margin_value,
+                effective_safe_margin,
             )
         )
         warnings.extend(title_warnings)
@@ -4365,6 +4494,46 @@ def _create_3view_drawing_from_model_doc(
             _call_update(sheet, drawing_document)
         )
         warnings.extend(final_update_warnings)
+
+        final_safe_area_verification = _verify_final_safe_area_annotations(
+            application,
+            sheet,
+            sheet_margin_value,
+            attempt_repair=True,
+        )
+        warnings.extend(final_safe_area_verification.get("warnings", []))
+
+        background_annotation_verification = None
+        if notes_result is not None:
+            from catia_mcp.tools.smart_annotation_layout import (
+                verify_annotations_within_sheet_safe_area,
+            )
+            background_annotation_verification = (
+                verify_annotations_within_sheet_safe_area(
+                    application,
+                    sheet_index=None,
+                    requested_sheet_margin_mm=sheet_margin_value,
+                    inner_frame_inset_mm=INNER_FRAME_INSET_MM,
+                    include_dimensions=False,
+                    include_texts=True,
+                    include_view_geometry=False,
+                    attempt_repair=True,
+                    strict_readback=True,
+                    exclude_system_views=False,
+                )
+            )
+            warnings.extend(
+                background_annotation_verification.get("warnings", [])
+            )
+            if not background_annotation_verification.get("ok", False):
+                raise DraftingOperationError(
+                    "Engineering tolerance/GD&T note text crosses the configured "
+                    "inner-frame safety area.",
+                    data={
+                        "final_safe_area_verification": final_safe_area_verification,
+                        "background_annotation_verification": background_annotation_verification,
+                    },
+                )
 
         save_result = None
         if output_path:
@@ -4416,7 +4585,7 @@ def _create_3view_drawing_from_model_doc(
                     layout.notes_y,
                 ],
                 "layout_basis": (
-                    "real paper width and height"
+                    "effective inner-frame safe area derived from real paper size"
                 ),
             },
             "views_count_before": views_before,
@@ -4459,7 +4628,12 @@ def _create_3view_drawing_from_model_doc(
                 },
             },
             "minimum_view_gap_mm": minimum_gap_value,
-            "sheet_margin_mm": sheet_margin_value,
+            "requested_sheet_margin_mm": sheet_margin_value,
+            "inner_frame_inset_mm": INNER_FRAME_INSET_MM,
+            "effective_safe_margin_mm": effective_safe_margin,
+            "safe_area": safe_area,
+            "final_safe_area_verification": final_safe_area_verification,
+            "background_annotation_verification": background_annotation_verification,
             "dimension_generation": dimension_generation,
             "title_block": title_block,
             "engineering_notes": notes_result,
@@ -4789,10 +4963,17 @@ def _add_3view_to_existing_drawing_doc(
         application,
         sheet,
     )
+    safe_area = _safe_area_descriptor(
+        paper_dimensions["width_mm"],
+        paper_dimensions["height_mm"],
+        sheet_margin_value,
+    )
+    effective_safe_margin = safe_area["effective_safe_margin_mm"]
     layout = _calculate_layout(
         paper_dimensions["width_mm"],
         paper_dimensions["height_mm"],
         projection["method"],
+        effective_safe_margin,
     )
     represented_object = _represented_3d_object(
         model_document
@@ -4894,7 +5075,7 @@ def _add_3view_to_existing_drawing_doc(
             minimum_gap_value,
             paper_dimensions["width_mm"],
             paper_dimensions["height_mm"],
-            sheet_margin_value,
+            effective_safe_margin,
         )
 
         views_after = int(sheet.Views.Count)
@@ -4967,6 +5148,14 @@ def _add_3view_to_existing_drawing_doc(
         )
         warnings.extend(final_update_warnings)
 
+        final_safe_area_verification = _verify_final_safe_area_annotations(
+            application,
+            sheet,
+            sheet_margin_value,
+            attempt_repair=True,
+        )
+        warnings.extend(final_safe_area_verification.get("warnings", []))
+
         save_result = {
             "requested": bool(save_after_add),
             "attempted": False,
@@ -5025,13 +5214,18 @@ def _add_3view_to_existing_drawing_doc(
             "sheet_projection": projection,
             "paper_dimensions": paper_dimensions,
             "scale": scale_value,
+            "requested_sheet_margin_mm": sheet_margin_value,
+            "inner_frame_inset_mm": INNER_FRAME_INSET_MM,
+            "effective_safe_margin_mm": effective_safe_margin,
+            "safe_area": safe_area,
+            "final_safe_area_verification": final_safe_area_verification,
             "layout": {
                 "front": [layout.front_x, layout.front_y],
                 "top": [layout.top_x, layout.top_y],
                 "right": [layout.right_x, layout.right_y],
                 "layout_basis": (
-                    "existing template paper size and "
-                    "projection method"
+                    "existing template paper size/projection method "
+                    "plus the effective inner-frame safe area"
                 ),
             },
             "views_count_before": views_before,

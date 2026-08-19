@@ -30,7 +30,7 @@ import time
 from typing import Any, Optional
 
 
-IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-18-v5-geometry-provenance"
+IMPLEMENTATION_VERSION = "catia-2d-dimensions-2026-08-19-v6-verified-tolerances"
 _CATVB_SCRIPT_LANGUAGE = 1
 _EPS = 1.0e-9
 _HELPER_GEOMETRY_PREFIX = "MCP_HELPER_"
@@ -874,23 +874,96 @@ def _set_tolerance(
     upper: Optional[float],
     lower: Optional[float],
     display_mode: int,
-) -> bool:
+) -> dict[str, Any]:
+    """Write a numerical tolerance and retain the exact CATIA API contract.
+
+    Some CATIA drafting standards silently reset a newly-created dimension
+    written with ``TOL_NUM2``/type 2 during the subsequent update.  The
+    caller uses the returned primary strategy to perform a post-update
+    readback and, where needed, retry the compatible type-1 presentation.
+    """
     if upper is None and lower is None:
-        return False
+        return {
+            "requested": False,
+            "set": False,
+            "strategy": None,
+            "attempts": [],
+        }
     up = _finite(0.0 if upper is None else upper, "tolerance_upper")
     low = _finite(-up if lower is None else lower, "tolerance_lower")
+    attempts: list[dict[str, Any]] = []
     try:
         dim.SetTolerances(
             2, "TOL_NUM2", "", "", up, low, int(display_mode)
         )
-    except Exception:
+        attempts.append({
+            "strategy": "type_2_TOL_NUM2_direct",
+            "succeeded": True,
+            "error": None,
+        })
+        return {
+            "requested": True,
+            "set": True,
+            "strategy": "type_2_TOL_NUM2_direct",
+            "attempts": attempts,
+        }
+    except Exception as direct_exc:
+        attempts.append({
+            "strategy": "type_2_TOL_NUM2_direct",
+            "succeeded": False,
+            "error": _format_error(direct_exc),
+        })
+    try:
         _evaluate(
             application,
             _TOLERANCE_VBS,
             "MCP_SetNumericTolerance",
             [dim, up, low, int(display_mode)],
         )
-    return True
+        attempts.append({
+            "strategy": "type_2_TOL_NUM2_evaluate",
+            "succeeded": True,
+            "error": None,
+        })
+        return {
+            "requested": True,
+            "set": True,
+            "strategy": "type_2_TOL_NUM2_evaluate",
+            "attempts": attempts,
+        }
+    except Exception as evaluate_exc:
+        attempts.append({
+            "strategy": "type_2_TOL_NUM2_evaluate",
+            "succeeded": False,
+            "error": _format_error(evaluate_exc),
+        })
+        raise RuntimeError(
+            "CATIA could not write the requested numerical tolerance."
+        ) from evaluate_exc
+
+
+def _retry_tolerance_with_compatible_type_1(
+    dim: Any,
+    upper: Optional[float],
+    lower: Optional[float],
+    display_mode: int,
+) -> dict[str, Any]:
+    """Retry the numerical side-by-side format that CATIA retains reliably."""
+    up = _finite(0.0 if upper is None else upper, "tolerance_upper")
+    low = _finite(-up if lower is None else lower, "tolerance_lower")
+    try:
+        dim.SetTolerances(1, "TOL_NUM2", "", "", up, low, int(display_mode))
+        return {
+            "strategy": "type_1_TOL_NUM2_direct_retry",
+            "succeeded": True,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "strategy": "type_1_TOL_NUM2_direct_retry",
+            "succeeded": False,
+            "error": _format_error(exc),
+        }
 
 
 def _get_tolerance(application: Any, dim: Any) -> dict[str, Any]:
@@ -1174,14 +1247,19 @@ def _add_internal(
                 _delete_objects(document, helper_points)
             raise ValueError("position_space must be 'view' or 'sheet'")
 
-    tolerance_set = False
+    tolerance_write = {
+        "requested": False,
+        "set": False,
+        "strategy": None,
+        "attempts": [],
+    }
     try:
         try:
             dim.ValueAutoMode = False
         except Exception as exc:
             warnings.append(f"could not disable automatic value placement: {_format_error(exc)}")
         dim.MoveValue(float(vx), float(vy), 0, 0)
-        tolerance_set = _set_tolerance(
+        tolerance_write = _set_tolerance(
             application, dim, tolerance_upper, tolerance_lower, tolerance_display_mode
         )
         warnings.extend(_update(document, sheet, view))
@@ -1226,10 +1304,36 @@ def _add_internal(
     tolerance_verified = _tolerance_matches_requested(
         tolerance_readback, tolerance_upper, tolerance_lower
     )
-    if tolerance_set and tolerance_verified is not True:
+    if tolerance_write["set"] and tolerance_verified is not True:
+        # CATIA can accept type 2 then reset its deviations during update.
+        # Retry the compatible type-1 numerical presentation and verify again.
+        compatible_retry = _retry_tolerance_with_compatible_type_1(
+            dim,
+            tolerance_upper,
+            tolerance_lower,
+            tolerance_display_mode,
+        )
+        tolerance_write["attempts"].append(compatible_retry)
+        if compatible_retry["succeeded"]:
+            warnings.extend(_update(document, sheet, view))
+            try:
+                dim.MoveValue(float(vx), float(vy), 0, 0)
+                view.SaveEdition()
+            except Exception:
+                pass
+            tolerance_readback = _get_tolerance(application, dim)
+            tolerance_verified = _tolerance_matches_requested(
+                tolerance_readback,
+                tolerance_upper,
+                tolerance_lower,
+            )
+            if tolerance_verified is True:
+                tolerance_write["strategy"] = compatible_retry["strategy"]
+    if tolerance_write["set"] and tolerance_verified is not True:
         warnings.append(
-            "CATIA accepted SetTolerances, but numerical tolerance readback did "
-            "not match the requested deviations; tolerance write is not verified."
+            "CATIA did not retain the requested numerical tolerance after "
+            "type-2 write and compatible type-1 retry; the dimension is not "
+            "reported as tolerance-verified."
         )
     data = {
         "view": str(getattr(view, "Name", "")),
@@ -1262,7 +1366,8 @@ def _add_internal(
             "value_boundary_box_view_mm": box,
             "verified": box is not None,
         },
-        "tolerance_set": tolerance_set,
+        "tolerance_set": tolerance_write["set"],
+        "tolerance_write": tolerance_write,
         "tolerance_readback": tolerance_readback,
         "tolerance_verified": tolerance_verified,
         "dimension_count_before": before,

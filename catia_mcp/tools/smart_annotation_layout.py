@@ -23,11 +23,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-IMPLEMENTATION_VERSION = "smart-annotation-layout-fixed-2026-08-05-v3"
+IMPLEMENTATION_VERSION = "smart-annotation-layout-safe-frame-2026-08-19-v4"
 _M_TO_MM = 1000.0
 _MM_TO_M = 0.001
 _EPSILON_MM = 1.0e-6
 _CATVB_SCRIPT_LANGUAGE = 0
+INNER_FRAME_INSET_MM = 40.0
 
 
 def _success(data: Any, warnings: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -729,6 +730,409 @@ def _collect_texts(
         except Exception as exc:
             warnings.append(f"DrawingText {index} skipped: {_format_com_error(exc)}")
     return records, warnings, total, metrics
+
+
+def _paper_dimensions_mm(application: Any, sheet: Any) -> Tuple[float, float, str]:
+    """Read sheet dimensions in millimetres without changing template settings."""
+    attempts: List[str] = []
+    try:
+        width = _finite_float(sheet.GetPaperWidth(), "DrawingSheet.GetPaperWidth")
+        height = _finite_float(sheet.GetPaperHeight(), "DrawingSheet.GetPaperHeight")
+        if width > 0.0 and height > 0.0:
+            return width, height, "DrawingSheet.GetPaperWidth/GetPaperHeight"
+    except Exception as exc:
+        attempts.append(_format_com_error(exc))
+
+    script = (
+        "Public Function MCP_GetPaperDimensions(sheetObject)\n"
+        "    MCP_GetPaperDimensions = Array(CDbl(sheetObject.GetPaperWidth()), "
+        "CDbl(sheetObject.GetPaperHeight()))\n"
+        "End Function"
+    )
+    try:
+        width, height = _numeric_sequence(
+            _evaluate(application, script, "MCP_GetPaperDimensions", [sheet]),
+            2,
+            "SystemService.Evaluate.DrawingSheet.GetPaperWidth/GetPaperHeight",
+        )
+        if width <= 0.0 or height <= 0.0:
+            raise RuntimeError("Paper dimensions must be positive.")
+        return width, height, "SystemService.Evaluate.DrawingSheet.GetPaperWidth/GetPaperHeight"
+    except Exception as exc:
+        attempts.append(_format_com_error(exc))
+    raise RuntimeError(f"Could not read paper dimensions. Attempts: {attempts}")
+
+
+def _safe_area_descriptor(
+    paper_width_mm: float,
+    paper_height_mm: float,
+    requested_sheet_margin_mm: float,
+    inner_frame_inset_mm: float,
+) -> Dict[str, Any]:
+    requested = _finite_float(requested_sheet_margin_mm, "requested_sheet_margin_mm")
+    inset = _finite_float(inner_frame_inset_mm, "inner_frame_inset_mm")
+    if requested < 0.0 or inset < 0.0:
+        raise ValueError("requested_sheet_margin_mm and inner_frame_inset_mm cannot be negative.")
+    effective = requested + inset
+    xmin = effective
+    ymin = effective
+    xmax = float(paper_width_mm) - effective
+    ymax = float(paper_height_mm) - effective
+    if xmax <= xmin or ymax <= ymin:
+        raise ToolOperationError(
+            "The requested margin plus inner-frame inset leaves no usable annotation area.",
+            data={
+                "paper_width_mm": paper_width_mm,
+                "paper_height_mm": paper_height_mm,
+                "requested_sheet_margin_mm": requested,
+                "inner_frame_inset_mm": inset,
+                "effective_safe_margin_mm": effective,
+            },
+        )
+    return {
+        "paper_width_mm": float(paper_width_mm),
+        "paper_height_mm": float(paper_height_mm),
+        "requested_sheet_margin_mm": requested,
+        "inner_frame_inset_mm": inset,
+        "effective_safe_margin_mm": effective,
+        "xmin_mm": xmin,
+        "xmax_mm": xmax,
+        "ymin_mm": ymin,
+        "ymax_mm": ymax,
+        "width_mm": xmax - xmin,
+        "height_mm": ymax - ymin,
+        "policy": "requested_sheet_margin_plus_fixed_inner_frame_inset",
+    }
+
+
+def _view_pose(view: Any) -> Tuple[float, float, float]:
+    x_mm = _finite_float(_safe_attr(view, "x", 0.0), "DrawingView.x")
+    y_mm = _finite_float(_safe_attr(view, "y", 0.0), "DrawingView.y")
+    try:
+        angle = float(_safe_attr(view, "Angle", 0.0))
+        if not math.isfinite(angle):
+            angle = 0.0
+    except (TypeError, ValueError):
+        angle = 0.0
+    return x_mm, y_mm, angle
+
+
+def _local_point_to_sheet(view: Any, x_mm: float, y_mm: float) -> Tuple[float, float]:
+    origin_x, origin_y, angle = _view_pose(view)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return (
+        origin_x + x_mm * cos_a - y_mm * sin_a,
+        origin_y + x_mm * sin_a + y_mm * cos_a,
+    )
+
+
+def _sheet_delta_to_local(view: Any, dx_mm: float, dy_mm: float) -> Tuple[float, float]:
+    _, _, angle = _view_pose(view)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return (
+        dx_mm * cos_a + dy_mm * sin_a,
+        -dx_mm * sin_a + dy_mm * cos_a,
+    )
+
+
+def _box_local_to_sheet(box: AnnotationBoundingBox, view: Any) -> AnnotationBoundingBox:
+    corners = [
+        _local_point_to_sheet(view, x, y)
+        for x, y in (
+            (box.x_min, box.y_min),
+            (box.x_max, box.y_min),
+            (box.x_max, box.y_max),
+            (box.x_min, box.y_max),
+        )
+    ]
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return AnnotationBoundingBox(
+        min(xs), min(ys), max(xs), max(ys),
+        item_id=box.item_id,
+        index=box.index,
+        kind=box.kind,
+        name=box.name,
+        text_content=box.text_content,
+        boundary_method=box.boundary_method + "+DrawingView_pose_to_sheet",
+        boundary_verified=box.boundary_verified,
+        boundary_attempts=list(box.boundary_attempts),
+    )
+
+
+def _safe_area_fit(box: AnnotationBoundingBox, safe_area: Dict[str, Any]) -> Dict[str, Any]:
+    width_fits = box.width <= safe_area["width_mm"] + _EPSILON_MM
+    height_fits = box.height <= safe_area["height_mm"] + _EPSILON_MM
+    dx = 0.0
+    dy = 0.0
+    if width_fits:
+        if box.x_min < safe_area["xmin_mm"]:
+            dx = safe_area["xmin_mm"] - box.x_min
+        elif box.x_max > safe_area["xmax_mm"]:
+            dx = safe_area["xmax_mm"] - box.x_max
+    if height_fits:
+        if box.y_min < safe_area["ymin_mm"]:
+            dy = safe_area["ymin_mm"] - box.y_min
+        elif box.y_max > safe_area["ymax_mm"]:
+            dy = safe_area["ymax_mm"] - box.y_max
+    within = bool(
+        box.x_min >= safe_area["xmin_mm"] - _EPSILON_MM
+        and box.x_max <= safe_area["xmax_mm"] + _EPSILON_MM
+        and box.y_min >= safe_area["ymin_mm"] - _EPSILON_MM
+        and box.y_max <= safe_area["ymax_mm"] + _EPSILON_MM
+    )
+    return {
+        "within_safe_area": within,
+        "box_fits_safe_area": bool(width_fits and height_fits),
+        "required_sheet_dx_mm": dx,
+        "required_sheet_dy_mm": dy,
+        "left_clearance_to_safe_edge_mm": box.x_min - safe_area["xmin_mm"],
+        "right_clearance_to_safe_edge_mm": safe_area["xmax_mm"] - box.x_max,
+        "bottom_clearance_to_safe_edge_mm": box.y_min - safe_area["ymin_mm"],
+        "top_clearance_to_safe_edge_mm": safe_area["ymax_mm"] - box.y_max,
+    }
+
+
+def _drawing_view_size_sheet(application: Any, view: Any) -> AnnotationBoundingBox:
+    script = (
+        "Public Function MCP_GetDrawingViewSizeForSafeArea(viewObject)\n"
+        "    Dim values(3)\n"
+        "    viewObject.Size values\n"
+        "    MCP_GetDrawingViewSizeForSafeArea = Array(CDbl(values(0)), CDbl(values(1)), "
+        "CDbl(values(2)), CDbl(values(3)))\n"
+        "End Function"
+    )
+    xmin, xmax, ymin, ymax = _numeric_sequence(
+        _evaluate(application, script, "MCP_GetDrawingViewSizeForSafeArea", [view]),
+        4,
+        "SystemService.Evaluate.DrawingView.Size",
+    )
+    return AnnotationBoundingBox(
+        xmin, ymin, xmax, ymax,
+        item_id=f"view:{str(_safe_attr(view, 'Name', ''))}",
+        kind="view_geometry",
+        name=str(_safe_attr(view, "Name", "")),
+        boundary_method="SystemService.Evaluate.DrawingView.Size_sheet_coordinates",
+        boundary_verified=True,
+    )
+
+
+def _is_system_view(view: Any, index: int) -> bool:
+    view_type = _safe_int(_safe_attr(view, "ViewType", None))
+    # CATIA's first two sheet views are the Main/Background system views.  Type
+    # codes 13 and 0 are also treated as system views for defensive compatibility.
+    return bool(index <= 2 or view_type in {0, 13})
+
+
+def verify_annotations_within_sheet_safe_area(
+    catia_app: Any,
+    sheet_index: Optional[int] = None,
+    requested_sheet_margin_mm: float = 15.0,
+    inner_frame_inset_mm: float = INNER_FRAME_INSET_MM,
+    include_dimensions: bool = True,
+    include_texts: bool = True,
+    include_view_geometry: bool = True,
+    attempt_repair: bool = True,
+    strict_readback: bool = True,
+    exclude_system_views: bool = True,
+) -> Dict[str, Any]:
+    """Verify/repair model-view annotations inside a sheet-coordinate safe area.
+
+    Dimension/text boxes are first read in DrawingView-local coordinates and then
+    transformed to sheet coordinates. Dimension values are moved with MoveValue;
+    DrawingText anchors are moved with x/y. DrawingView.Size is verified but is not
+    independently moved here because projected-view group movement belongs to the
+    drafting layout solver.
+    """
+    _, sheet, document, target = _get_drawing_view(catia_app, None, sheet_index)
+    paper_width, paper_height, paper_method = _paper_dimensions_mm(catia_app, sheet)
+    safe_area = _safe_area_descriptor(
+        paper_width, paper_height, requested_sheet_margin_mm, inner_frame_inset_mm
+    )
+    warnings: List[str] = []
+    view_results: List[Dict[str, Any]] = []
+    total_violations = 0
+    unrepaired_violations = 0
+    repaired_count = 0
+
+    views = sheet.Views
+    for view_index in range(1, int(views.Count) + 1):
+        view = views.Item(view_index)
+        if exclude_system_views and _is_system_view(view, view_index):
+            continue
+        view_name = str(_safe_attr(view, "Name", f"View.{view_index}"))
+        item_results: List[Dict[str, Any]] = []
+
+        if include_view_geometry:
+            try:
+                geometry_box = _drawing_view_size_sheet(catia_app, view)
+                fit = _safe_area_fit(geometry_box, safe_area)
+                if not fit["within_safe_area"]:
+                    total_violations += 1
+                    unrepaired_violations += 1
+                item_results.append({
+                    "kind": "view_geometry",
+                    "id": geometry_box.item_id,
+                    "sheet_box": geometry_box.as_dict(),
+                    "safe_area_fit": fit,
+                    "repair_attempted": False,
+                    "repair_supported_here": False,
+                    "final_within_safe_area": fit["within_safe_area"],
+                })
+            except Exception as exc:
+                unrepaired_violations += 1
+                total_violations += 1
+                item_results.append({
+                    "kind": "view_geometry",
+                    "id": f"view:{view_name}",
+                    "read_error": _format_com_error(exc),
+                    "final_within_safe_area": False,
+                })
+
+        dimensions, dimension_warnings, dimension_total = _collect_dimensions(catia_app, view)
+        warnings.extend(f"{view_name}: {message}" for message in dimension_warnings)
+        if include_dimensions and strict_readback and len(dimensions) != dimension_total:
+            unrepaired_violations += 1
+            total_violations += 1
+        if include_dimensions:
+            for record in dimensions:
+                sheet_box = _box_local_to_sheet(record.box, view)
+                fit = _safe_area_fit(sheet_box, safe_area)
+                repair_detail: Optional[Dict[str, Any]] = None
+                final_fit = fit
+                final_sheet_box = sheet_box
+                if not fit["within_safe_area"]:
+                    total_violations += 1
+                    if attempt_repair and fit["box_fits_safe_area"]:
+                        local_dx, local_dy = _sheet_delta_to_local(
+                            view, fit["required_sheet_dx_mm"], fit["required_sheet_dy_mm"]
+                        )
+                        repair_detail = _move_dimension_center_verified(
+                            catia_app,
+                            record,
+                            record.box.center_x + local_dx,
+                            record.box.center_y + local_dy,
+                            document,
+                            sheet,
+                            tolerance_mm=0.05,
+                        )
+                        if repair_detail.get("verified"):
+                            new_local = _dimension_boundary(catia_app, record.obj, record.index)
+                            final_sheet_box = _box_local_to_sheet(new_local, view)
+                            final_fit = _safe_area_fit(final_sheet_box, safe_area)
+                    if final_fit["within_safe_area"]:
+                        repaired_count += 1
+                    else:
+                        unrepaired_violations += 1
+                item_results.append({
+                    "kind": "dimension",
+                    "id": record.box.item_id,
+                    "local_box_before": record.box.as_dict(),
+                    "sheet_box_before": sheet_box.as_dict(),
+                    "safe_area_fit_before": fit,
+                    "repair_attempted": repair_detail is not None,
+                    "repair": repair_detail,
+                    "sheet_box_final": final_sheet_box.as_dict(),
+                    "safe_area_fit_final": final_fit,
+                    "final_within_safe_area": final_fit["within_safe_area"],
+                })
+
+        texts, text_warnings, text_total, _ = _collect_texts(view)
+        warnings.extend(f"{view_name}: {message}" for message in text_warnings)
+        if include_texts and strict_readback and len(texts) != text_total:
+            unrepaired_violations += 1
+            total_violations += 1
+        if include_texts and texts:
+            warnings.append(
+                f"{view_name}: DrawingText bounds are conservative estimates; safe-area verification is conservative."
+            )
+        if include_texts:
+            for record in texts:
+                sheet_box = _box_local_to_sheet(record.box, view)
+                fit = _safe_area_fit(sheet_box, safe_area)
+                repair_detail = None
+                final_fit = fit
+                final_sheet_box = sheet_box
+                if not fit["within_safe_area"]:
+                    total_violations += 1
+                    if attempt_repair and fit["box_fits_safe_area"]:
+                        local_dx, local_dy = _sheet_delta_to_local(
+                            view, fit["required_sheet_dx_mm"], fit["required_sheet_dy_mm"]
+                        )
+                        repair_detail = _set_text_anchor_mm(
+                            record,
+                            record.anchor_x_mm + local_dx,
+                            record.anchor_y_mm + local_dy,
+                        )
+                        if repair_detail.get("verified"):
+                            updated_box, _, _, _ = _estimated_text_boundary(record.obj, record.index)
+                            final_sheet_box = _box_local_to_sheet(updated_box, view)
+                            final_fit = _safe_area_fit(final_sheet_box, safe_area)
+                    if final_fit["within_safe_area"]:
+                        repaired_count += 1
+                    else:
+                        unrepaired_violations += 1
+                item_results.append({
+                    "kind": "text",
+                    "id": record.box.item_id,
+                    "local_box_before": record.box.as_dict(),
+                    "sheet_box_before": sheet_box.as_dict(),
+                    "safe_area_fit_before": fit,
+                    "repair_attempted": repair_detail is not None,
+                    "repair": repair_detail,
+                    "sheet_box_final": final_sheet_box.as_dict(),
+                    "safe_area_fit_final": final_fit,
+                    "final_within_safe_area": final_fit["within_safe_area"],
+                    "boundary_is_estimated": True,
+                })
+
+        view_results.append({
+            "view_index": view_index,
+            "view_name": view_name,
+            "view_type_code": _safe_int(_safe_attr(view, "ViewType", None)),
+            "items": item_results,
+            "all_items_within_safe_area": all(
+                bool(item.get("final_within_safe_area", False)) for item in item_results
+            ),
+        })
+
+    update_attempts, update_warnings = _update_drawing(document, sheet)
+    warnings.extend(update_warnings)
+    data = {
+        "operation": "verify_annotations_within_sheet_safe_area",
+        "target": target,
+        "paper_dimension_read_method": paper_method,
+        "safe_area": safe_area,
+        "requested_sheet_margin_mm": safe_area["requested_sheet_margin_mm"],
+        "inner_frame_inset_mm": safe_area["inner_frame_inset_mm"],
+        "effective_safe_margin_mm": safe_area["effective_safe_margin_mm"],
+        "include_dimensions": bool(include_dimensions),
+        "include_texts": bool(include_texts),
+        "include_view_geometry": bool(include_view_geometry),
+        "attempt_repair": bool(attempt_repair),
+        "strict_readback": bool(strict_readback),
+        "exclude_system_views": bool(exclude_system_views),
+        "view_results": view_results,
+        "violations_detected": total_violations,
+        "violations_repaired": repaired_count,
+        "violations_remaining": unrepaired_violations,
+        "all_within_safe_area": unrepaired_violations == 0,
+        "coordinate_policy": "DrawingView-local annotation boxes transformed to sheet coordinates",
+        "update_attempts": update_attempts,
+        "model_modified": repaired_count > 0,
+        "document_save_required": repaired_count > 0,
+        "document_saved": _document_saved(document),
+    }
+    if unrepaired_violations:
+        return _error(
+            "One or more views/annotations remain outside the configured inner-frame safe area.",
+            data=data,
+            warnings=warnings,
+            status="partial_success" if repaired_count else "error",
+        )
+    return _success(data, warnings)
 
 
 def _conflicts(
@@ -1802,6 +2206,7 @@ def fix_overlapping_annotations(
 
 # Retained as machine-readable metadata for integrations that inspect modules.
 SMART_ANNOTATION_MCP_TOOLS = [
+    {"name": "verify_annotations_within_sheet_safe_area", "handler": verify_annotations_within_sheet_safe_area},
     {"name": "analyze_annotation_layout", "handler": analyze_annotation_layout},
     {"name": "auto_arrange_dimensions", "handler": auto_arrange_dimensions},
     {"name": "fix_overlapping_annotations", "handler": fix_overlapping_annotations},
@@ -1826,9 +2231,46 @@ def register_tools(mcp: Any, ctx: Any) -> list[str]:
     """Register tools using the same decorator pattern as the server modules."""
     conn = ctx.conn
     names: list[str] = []
+    verify_safe_impl = globals()["verify_annotations_within_sheet_safe_area"]
     analyze_impl = globals()["analyze_annotation_layout"]
     arrange_impl = globals()["auto_arrange_dimensions"]
     fix_impl = globals()["fix_overlapping_annotations"]
+
+    @mcp.tool()
+    def verify_annotations_within_sheet_safe_area(
+        sheet_index: Optional[int] = None,
+        requested_sheet_margin_mm: float = 15.0,
+        inner_frame_inset_mm: float = INNER_FRAME_INSET_MM,
+        include_dimensions: bool = True,
+        include_texts: bool = True,
+        include_view_geometry: bool = True,
+        attempt_repair: bool = True,
+        strict_readback: bool = True,
+        exclude_system_views: bool = True,
+    ) -> Dict[str, Any]:
+        """Keep model views, dimension value boxes and texts inside one safe area."""
+        try:
+            app = conn.connect(visible=True)
+            return _attach_runtime_evidence(verify_safe_impl(
+                app,
+                sheet_index,
+                requested_sheet_margin_mm,
+                inner_frame_inset_mm,
+                include_dimensions,
+                include_texts,
+                include_view_geometry,
+                attempt_repair,
+                strict_readback,
+                exclude_system_views,
+            ))
+        except ToolOperationError as exc:
+            return _error(
+                str(exc), data=exc.data, warnings=exc.warnings, status=exc.status
+            )
+        except Exception as exc:
+            return _error(_format_com_error(exc))
+
+    names.append("verify_annotations_within_sheet_safe_area")
 
     @mcp.tool()
     def analyze_annotation_layout(
